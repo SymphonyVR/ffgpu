@@ -25,7 +25,9 @@ jobs:
             libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libavfilter-dev \
             libasound2-dev libudev-dev libpulse-dev libwayland-dev libxkbcommon-dev
       - name: Apply audited repairs
-        run: python3 .repair/repair.py
+        run: |
+          python3 .repair/prep.py
+          python3 .repair/repair.py
       - name: Format
         run: cargo fmt --all
       - name: Diff sanity
