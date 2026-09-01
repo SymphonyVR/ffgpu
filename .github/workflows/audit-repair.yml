@@ -1,0 +1,47 @@
+name: audited repair
+
+on:
+  push:
+    branches: [audit-repair]
+    paths:
+      - '.repair/repair.py'
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.actor != 'github-actions[bot]' && hashFiles('.repair/repair.py') != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config clang libclang-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libavfilter-dev \
+            libasound2-dev libudev-dev libpulse-dev libwayland-dev libxkbcommon-dev
+      - name: Apply audited repairs
+        run: python3 .repair/repair.py
+      - name: Format
+        run: cargo fmt --all
+      - name: Diff sanity
+        run: git diff --check
+      - name: Check library
+        run: cargo check --lib
+      - name: Unit tests
+        run: cargo test --lib
+      - name: Commit validated repair
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src tests README.md Cargo.toml Cargo.lock
+          if git diff --cached --quiet; then
+            echo 'No source changes to commit'
+            exit 0
+          fi
+          git commit -m 'fix: repair decoder synchronization and color correctness'
+          git push origin HEAD:audit-repair
