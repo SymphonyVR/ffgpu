@@ -45,7 +45,7 @@ use crate::{
     SeekMode,
     decode::{
         self, Clock, DecoderState, Frame, FrameQueue, PacketQueueMetadata,
-        audio::{self, AudioSink, AudioThread, AudioStream},
+        audio::{self, AudioSink, AudioStream, AudioThread},
         read::{Input, ReadMessage, ReadThread},
         video::{self, VideoStream},
     },
@@ -237,7 +237,10 @@ impl PixelFormat {
             // order for 24-bit formats when wrapped in DynamicImageBuffer::RGB).
             x if x == ff::AVPixelFormat::AV_PIX_FMT_BGR24 => Some(Self::Rgb24),
             x if x == ff::AVPixelFormat::AV_PIX_FMT_YUV444P
-                || x == ff::AVPixelFormat::AV_PIX_FMT_YUVJ444P => Some(Self::Yuv444P),
+                || x == ff::AVPixelFormat::AV_PIX_FMT_YUVJ444P =>
+            {
+                Some(Self::Yuv444P)
+            }
             // YUV422 packed variants — all stored as Yuv422 and
             // converted in `to_rgba()` via the same code path.
             // ffmpeg-next 8.1.0 exposes 3 of 4: YUYV422, UYVY422,
@@ -246,7 +249,10 @@ impl PixelFormat {
             // and decode to a different format if produced.
             x if x == ff::AVPixelFormat::AV_PIX_FMT_YUYV422
                 || x == ff::AVPixelFormat::AV_PIX_FMT_YVYU422
-                || x == ff::AVPixelFormat::AV_PIX_FMT_UYVY422 => Some(Self::Yuv422),
+                || x == ff::AVPixelFormat::AV_PIX_FMT_UYVY422 =>
+            {
+                Some(Self::Yuv422)
+            }
             _ => None,
         }
     }
@@ -287,8 +293,9 @@ impl ColorMatrix {
             | ff::AVColorSpace::AVCOL_SPC_SMPTE170M
             | ff::AVColorSpace::AVCOL_SPC_SMPTE240M => Self::Bt601,
             ff::AVColorSpace::AVCOL_SPC_BT709 => Self::Bt709,
-            ff::AVColorSpace::AVCOL_SPC_BT2020_NCL
-            | ff::AVColorSpace::AVCOL_SPC_BT2020_CL => Self::Bt2020,
+            ff::AVColorSpace::AVCOL_SPC_BT2020_NCL | ff::AVColorSpace::AVCOL_SPC_BT2020_CL => {
+                Self::Bt2020
+            }
             ff::AVColorSpace::AVCOL_SPC_RGB => Self::Identity,
             _ => Self::Bt709,
         }
@@ -391,9 +398,7 @@ impl SoftwareFrame {
                 let cr = (v - uv_off) * uv_scale / 255.0;
 
                 let r = (luma + 2.0 * (1.0 - kr) * cr).clamp(0.0, 1.0);
-                let g = (luma
-                    - 2.0 * kr * cb / kg
-                    - 2.0 * (1.0 - kr) * cr * (1.0 - kb) / kg)
+                let g = (luma - 2.0 * kr * cb / kg - 2.0 * (1.0 - kr) * cr * (1.0 - kb) / kg)
                     .clamp(0.0, 1.0);
                 let b = (luma + 2.0 * (1.0 - kb) * cb).clamp(0.0, 1.0);
 
@@ -441,9 +446,7 @@ impl SoftwareFrame {
                 let cr = (v_sample - uv_off) / 255.0 * uv_scale - 0.5;
 
                 let r = (luma + 2.0 * (1.0 - kr) * cr).clamp(0.0, 1.0);
-                let g = (luma
-                    - 2.0 * kr * cb / kg
-                    - 2.0 * (1.0 - kr) * cr * (1.0 - kb) / kg)
+                let g = (luma - 2.0 * kr * cb / kg - 2.0 * (1.0 - kr) * cr * (1.0 - kb) / kg)
                     .clamp(0.0, 1.0);
                 let b = (luma + 2.0 * (1.0 - kb) * cb).clamp(0.0, 1.0);
 
@@ -486,9 +489,7 @@ impl SoftwareFrame {
                 let cr = (v_sample - uv_off) / 255.0 * uv_scale - 0.5;
 
                 let r = (luma + 2.0 * (1.0 - kr) * cr).clamp(0.0, 1.0);
-                let g = (luma
-                    - 2.0 * kr * cb / kg
-                    - 2.0 * (1.0 - kr) * cr * (1.0 - kb) / kg)
+                let g = (luma - 2.0 * kr * cb / kg - 2.0 * (1.0 - kr) * cr * (1.0 - kb) / kg)
                     .clamp(0.0, 1.0);
                 let b = (luma + 2.0 * (1.0 - kb) * cb).clamp(0.0, 1.0);
 
@@ -610,8 +611,7 @@ impl SoftwareDecodeVideo {
         // Force software decode: no hwaccel device type, no hw context.
         let device_type = ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
         let hw_device_ctx = None;
-        let video_decoder =
-            video::Decoder::new(&mut input.format_ctx, device_type, hw_device_ctx)?;
+        let video_decoder = video::Decoder::new(&mut input.format_ctx, device_type, hw_device_ctx)?;
         let audio_decoder = audio::Decoder::new(&mut input)?;
 
         let (video_tx, video_rx, video_meta) = decode::packet_queue();
@@ -832,11 +832,9 @@ impl SoftwareDecodeVideo {
         self.last_audio_pts_ms = 0.0;
         self.queued_frame = None;
 
-        let _ = self.read_messages.send(ReadMessage::SeekStream {
-            ts,
-            mode,
-            forward,
-        });
+        let _ = self
+            .read_messages
+            .send(ReadMessage::SeekStream { ts, mode, forward });
     }
 
     pub fn set_discard(&self, level: crate::DiscardLevel) {
@@ -1027,10 +1025,9 @@ impl SoftwareDecodeVideo {
                 let height = unsafe { (*raw).height } as u32;
                 let color_range = unsafe { (*raw).color_range };
                 let color_space = unsafe { (*raw).colorspace };
-                let pixel_format = PixelFormat::from_ffmpeg(
-                    unsafe { std::mem::transmute(fmt_raw) },
-                )
-                .ok_or(crate::Error::UnsupportedPixelFormat)?;
+                let pixel_format =
+                    PixelFormat::from_ffmpeg(unsafe { std::mem::transmute(fmt_raw) })
+                        .ok_or(crate::Error::UnsupportedPixelFormat)?;
 
                 extract_planes(
                     &f.frame,
@@ -1093,6 +1090,18 @@ impl SoftwareDecodeVideo {
     /// true`).
     pub fn frame(&mut self) -> Option<SoftwareFrame> {
         self.queued_frame.take()
+    }
+
+    /// Return decoded YUV plane buffers to the decoder so the next
+    /// `update()` reuses their capacity instead of allocating a fresh
+    /// ~9.4MB (4K) of virtual memory and page-faulting it every frame.
+    /// Called by the engine's software bridge worker after it has
+    /// converted the frame. The buffers are emptied by `mem::take` in
+    /// `update()`, so a missed recycle is a safe (if slower) fallback.
+    pub fn recycle_planes(&mut self, y: Vec<u8>, uv: Vec<u8>, v: Vec<u8>) {
+        self.frame_y = y;
+        self.frame_uv = uv;
+        self.frame_v = v;
     }
 
     /// Adjust `current_rate` based on the rolling-average gap.
@@ -1161,11 +1170,7 @@ impl Default for PacketQueueMetadata {
 /// job." Software consumers (the engine's worker) want a
 /// `SoftwareFrame`, not an `ffn::Frame`, so the conversion happens
 /// here — out of the decode hot path and out of the render thread.
-fn run_software_consumer(
-    state: Arc<DecoderState>,
-    queue: FrameQueue,
-    tx: Sender<SoftwareFrame>,
-) {
+fn run_software_consumer(state: Arc<DecoderState>, queue: FrameQueue, tx: Sender<SoftwareFrame>) {
     while state.alive.load(Ordering::Relaxed) {
         let Some(frame) = queue.try_next() else {
             // Frame queue empty — yield briefly. The VideoThread will
@@ -1296,10 +1301,7 @@ fn extract_planes(
                 let row_bytes = width;
                 let uv_ptr = (*raw).data[1] as *const u8;
                 if uv_stride == row_bytes {
-                    uv.extend_from_slice(std::slice::from_raw_parts(
-                        uv_ptr,
-                        row_bytes * plane_h,
-                    ));
+                    uv.extend_from_slice(std::slice::from_raw_parts(uv_ptr, row_bytes * plane_h));
                 } else {
                     for row in 0..plane_h {
                         let src =
@@ -1360,10 +1362,7 @@ fn extract_planes(
                 let row_bytes = width * channels;
                 let data_ptr = (*raw).data[0] as *const u8;
                 if stride == row_bytes {
-                    y.extend_from_slice(std::slice::from_raw_parts(
-                        data_ptr,
-                        row_bytes * height,
-                    ));
+                    y.extend_from_slice(std::slice::from_raw_parts(data_ptr, row_bytes * height));
                 } else {
                     for row in 0..height {
                         let src = std::slice::from_raw_parts(data_ptr.add(row * stride), row_bytes);
@@ -1381,10 +1380,7 @@ fn extract_planes(
                 let stride = (*raw).linesize[0] as usize;
                 let data_ptr = (*raw).data[0] as *const u8;
                 if stride == row_bytes {
-                    y.extend_from_slice(std::slice::from_raw_parts(
-                        data_ptr,
-                        row_bytes * height,
-                    ));
+                    y.extend_from_slice(std::slice::from_raw_parts(data_ptr, row_bytes * height));
                 } else {
                     for row in 0..height {
                         let src = std::slice::from_raw_parts(data_ptr.add(row * stride), row_bytes);
