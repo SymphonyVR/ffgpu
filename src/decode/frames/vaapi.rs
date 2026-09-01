@@ -1,4 +1,5 @@
 use super::FrameAdapter;
+use super::GlInteropTicket;
 use crate::{
     Error,
     context::{layout, pipeline_cache::PipelineCache},
@@ -330,7 +331,7 @@ impl FrameAdapter for VAAPIFrameAdapter {
         _queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         pipeline_cache: &mut PipelineCache,
-    ) -> Result<()> {
+    ) -> Result<Option<GlInteropTicket>> {
         unsafe {
             let frame_ref = frame.as_ref();
 
@@ -349,7 +350,7 @@ impl FrameAdapter for VAAPIFrameAdapter {
 
             imported.import_frame(instance, device, encoder, frame);
 
-            Ok(())
+            Ok(None)
         }
     }
 

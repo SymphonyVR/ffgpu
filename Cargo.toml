@@ -4,8 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["cpal"]
+default = ["cpal", "video"]
 cpal = ["dep:cpal"]
+# Software-only video path (no wgpu device required). Used by the engine's
+# CPU rendering fallback. The GPU path (Context/Video) does not require this
+# feature — it only needs wgpu.
+video = []
+# Quarantines the Windows WGL_NV_DX_interop2 path. Off by default — the engine
+# uses the cross-vendor GL_EXT_memory_object_win32 + GL_EXT_win32_keyed_mutex
+# path. Build with `--features experimental-wgl-interop` only when
+# deliberately chasing NVIDIA-specific WGL behaviour. The WGL ring code is
+# compiled out when this feature is off.
+experimental-wgl-interop = []
 
 [dependencies]
 ffmpeg-next = "8.0"
@@ -20,12 +30,23 @@ atomic_float = "1.1"
 arc-swap = "1.8"
 
 # for native audio output
-cpal = { version = "0.17", optional = true }
+# The `realtime` feature promotes cpal's WASAPI callback thread (MMCSS Pro
+# Audio on Windows) via audio_thread_priority — no manual promote needed on
+# that thread.
+cpal = { version = "0.18", features = ["realtime"], optional = true }
 ringbuf = "0.4"
+# Cross-platform real-time audio thread priority for the producer threads
+# (decode + ring-buffer fill). Version pinned to match cpal's dep so Cargo
+# compiles a single copy. Windows MMCSS / Linux rtkit / macOS Mach.
+audio_thread_priority = "0.35"
 ash = "0.38"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.62", features = ["Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Security", "Win32_Graphics_Direct3D12"] }
+windows = { version = "0.62", features = ["Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Security", "Win32_Graphics_Direct3D12", "Win32_Graphics_Direct3D_Fxc"] }
+# Raw OpenGL entry points for GL_EXT_memory_object_win32 import on the native
+# WGL backend (used by the OpenGL zero-copy video path). No higher-level GL
+# wrapper — we only need a handful of extension functions.
+gl = "0.14"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
@@ -36,6 +57,9 @@ coreaudio-sys = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 libpulse-binding = "2.28"
+# EGL for EGL_EXT_image_dma_buf_import (VA-API / DRM PRIME zero-copy on GL).
+khronos-egl = "6.0"
+gl = "0.14"
 
 [dev-dependencies]
 glyphon = { git = "https://github.com/grovesNL/glyphon.git", rev = "28f1cb92e120ab790eca9ecc6aeb0ed8c8336fc0" }

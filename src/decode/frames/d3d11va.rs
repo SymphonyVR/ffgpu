@@ -1,4 +1,5 @@
 use super::FrameAdapter;
+use super::GlInteropTicket;
 use crate::{
     context::{layout, pipeline_cache::PipelineCache},
     decode::frames::FrameAdapterBuilder,
@@ -17,14 +18,14 @@ use windows::{
 // see libavutil/hwcontext_d3d11va.h
 // valid for ffmpeg 3.4 to 8.0 (asserted by AVUTIL_VERSION)
 #[repr(C)]
-struct AVD3D11VADeviceContext {
-    device: *mut c_void,
-    device_context: *mut c_void,
-    video_device: *mut c_void,
-    video_context: *mut c_void,
-    lock: unsafe extern "C" fn(*mut c_void),
-    unlock: unsafe extern "C" fn(*mut c_void),
-    lock_ctx: *mut c_void,
+pub(crate) struct AVD3D11VADeviceContext {
+    pub(crate) device: *mut c_void,
+    pub(crate) device_context: *mut c_void,
+    pub(crate) video_device: *mut c_void,
+    pub(crate) video_context: *mut c_void,
+    pub(crate) lock: unsafe extern "C" fn(*mut c_void),
+    pub(crate) unlock: unsafe extern "C" fn(*mut c_void),
+    pub(crate) lock_ctx: *mut c_void,
 }
 
 fn get_dxgi_yuv_format(format: Dxgi::Common::DXGI_FORMAT) -> Option<wgpu::TextureFormat> {
@@ -62,6 +63,9 @@ struct ImportedTexture {
     // by passing "SHARED" in an AVDictionary to hwcontext_d3d11va
     // which means we could skip copying to another D3D11 with the SHARED flag and directly export the FFmpeg-created texture
     shared_texture: D3D11::ID3D11Texture2D,
+    /// The wgpu texture wrapped from `shared_texture` (NV12 multi-planar). Stored
+    /// so the engine can build its own YUV bind group for direct sampling.
+    texture: wgpu::Texture,
     identity: layout::FrameDescriptor<()>,
     bg0: wgpu::BindGroup,
 }
@@ -104,6 +108,7 @@ impl ImportedTexture {
 
             Ok(ImportedTexture {
                 shared_texture,
+                texture,
                 identity: layout.as_identity(),
                 bg0,
             })
@@ -147,6 +152,7 @@ impl ImportedTexture {
 
             Ok(ImportedTexture {
                 shared_texture,
+                texture,
                 identity: layout.as_identity(),
                 bg0,
             })
@@ -269,7 +275,10 @@ impl ImportedTexture {
                         view_formats: vec![],
                     },
                 )
-                .map_err(|_| Error::TextureShare)?;
+                .map_err(|e| {
+                    log::error!("[D3D11VA] texture_from_d3d11_shared_handle failed: {:?}", e);
+                    Error::TextureShare
+                })?;
 
             Ok(device.create_texture_from_hal::<wgpu::hal::vulkan::Api>(
                 hal_texture,
@@ -313,7 +322,7 @@ fn acquire_ffmpeg_lock(
 
 pub struct D3D11VAFrameAdapter {
     d3d11_ctx: *mut AVD3D11VADeviceContext,
-    d3d11_device: ManuallyDrop<D3D11::ID3D11Device>,
+    d3d11_device: D3D11::ID3D11Device,
     imported_texture: Option<ImportedTexture>,
 }
 
@@ -321,11 +330,37 @@ impl FrameAdapterBuilder for D3D11VAFrameAdapter {
     unsafe fn new(decoder: NonNull<ff::AVCodecContext>) -> Result<Self> {
         unsafe {
             let hwctx = decoder.as_ref().hw_device_ctx;
+            if hwctx.is_null() {
+                // Can happen when the VideoThread falls back to a software
+                // decoder while D3D11 frames are still in the frame queue:
+                // the current codec context has no D3D11 device. Fail
+                // gracefully so the engine can drop the stale frames.
+                log::error!(
+                    "[D3D11VA] codec context has no hw_device_ctx (stale frame after decoder swap?)"
+                );
+                return Err(Error::TextureShare);
+            }
 
             let device_ctx = hwctx.as_ref().unwrap().data as *mut ff::AVHWDeviceContext;
+            if device_ctx.is_null() {
+                return Err(Error::TextureShare);
+            }
             let d3d11_ctx = (*device_ctx).hwctx as *mut AVD3D11VADeviceContext;
-            let d3d11_device: ManuallyDrop<D3D11::ID3D11Device> =
-                ManuallyDrop::new(core::mem::transmute((*d3d11_ctx).device));
+            if d3d11_ctx.is_null() {
+                return Err(Error::TextureShare);
+            }
+            // Take an independent COM reference (QueryInterface): the
+            // AVHWDeviceContext's own ref is released at decoder teardown
+            // (decode/video.rs now transfers the hwctx to the codec context,
+            // so it can be freed — previously the leaked ref kept the device
+            // alive by accident). This QI'd ref keeps the D3D11 device alive
+            // for the adapter and its Drop (Release) balances it, so the
+            // unref ordering never matters.
+            let d3d11_device: D3D11::ID3D11Device =
+                core::mem::transmute((*d3d11_ctx).device);
+            let d3d11_device = d3d11_device
+                .cast::<D3D11::ID3D11Device>()
+                .map_err(|_| Error::TextureShare)?;
 
             Ok(D3D11VAFrameAdapter {
                 d3d11_ctx,
@@ -350,7 +385,7 @@ impl FrameAdapter for D3D11VAFrameAdapter {
         _queue: &wgpu::Queue,
         _encoder: &mut wgpu::CommandEncoder,
         pipeline_cache: &mut PipelineCache,
-    ) -> Result<()> {
+    ) -> Result<Option<GlInteropTicket>> {
         unsafe {
             let frame = frame.as_ref();
             if frame.data[0].is_null() {
@@ -398,6 +433,14 @@ impl FrameAdapter for D3D11VAFrameAdapter {
                 self.imported_texture.insert(imported_texture)
             };
 
+            // The keyed mutex (AcquireSync/ReleaseSync) below synchronizes
+            // D3D11 writes with Vulkan/wgpu reads of the shared texture.
+            // We intentionally do NOT call device.poll(wait_indefinitely) here
+            // because that would wait for ALL wgpu queue work — including the
+            // render thread's blit pass (Mitchell/Easu resize) — creating a
+            // full CPU-GPU pipeline stall that halves the framerate.
+            // The keyed mutex is sufficient: AcquireSync(0, INFINITE) blocks
+            // until the Vulkan side releases the mutex after finishing its read.
             imported_texture
                     .shared_texture
                     .cast::<Dxgi::IDXGIKeyedMutex>()
@@ -429,7 +472,7 @@ impl FrameAdapter for D3D11VAFrameAdapter {
             // unlock ffmpeg mutex
             drop(d3d11_lock);
 
-            Ok(())
+            Ok(None)
         }
     }
 
@@ -441,6 +484,23 @@ impl FrameAdapter for D3D11VAFrameAdapter {
 
     fn bind_group(&self) -> Option<&wgpu::BindGroup> {
         self.imported_texture.as_ref().map(|texture| &texture.bg0)
+    }
+
+    fn plane_views(&self) -> Option<Vec<wgpu::TextureView>> {
+        self.imported_texture.as_ref().map(|t| {
+            vec![
+                t.texture
+                    .create_view(&wgpu::TextureViewDescriptor {
+                        aspect: wgpu::TextureAspect::Plane0,
+                        ..Default::default()
+                    }),
+                t.texture
+                    .create_view(&wgpu::TextureViewDescriptor {
+                        aspect: wgpu::TextureAspect::Plane1,
+                        ..Default::default()
+                    }),
+            ]
+        })
     }
 
     fn name(&self) -> &'static str {

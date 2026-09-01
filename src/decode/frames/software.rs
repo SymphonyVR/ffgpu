@@ -6,6 +6,8 @@ use crate::{
 use ffmpeg_next::sys as ff;
 use std::ptr::NonNull;
 
+use super::GlInteropTicket;
+
 struct Texture {
     pixel_format: ff::AVPixelFormat,
     textures: layout::FrameDescriptor<wgpu::Texture>,
@@ -15,6 +17,10 @@ struct Texture {
 pub struct SoftwareFrameAdapter {
     mapped_frame: NonNull<ff::AVFrame>,
     texture: Option<Texture>,
+    /// True when this adapter is handling hardware-decoded frames (e.g. D3D11VA)
+    /// that are being transferred to CPU memory as a fallback. This distinguishes
+    /// "hardware decoding with CPU frame transfer" from pure software decoding.
+    hw_transfer: bool,
 }
 
 impl FrameAdapterBuilder for SoftwareFrameAdapter {
@@ -24,6 +30,7 @@ impl FrameAdapterBuilder for SoftwareFrameAdapter {
         Ok(SoftwareFrameAdapter {
             mapped_frame,
             texture: None,
+            hw_transfer: false,
         })
     }
 
@@ -42,8 +49,15 @@ impl FrameAdapter for SoftwareFrameAdapter {
         queue: &wgpu::Queue,
         _encoder: &mut wgpu::CommandEncoder,
         pipeline_cache: &mut PipelineCache,
-    ) -> Result<()> {
+    ) -> Result<Option<GlInteropTicket>> {
         let frame = unsafe { frame.as_ref() };
+
+        // Detect whether we're handling hardware-decoded frames (e.g. D3D11VA
+        // fallback). This is used by name() to distinguish "hardware decoding
+        // with CPU frame transfer" from pure software decoding.
+        if !frame.hw_frames_ctx.is_null() {
+            self.hw_transfer = true;
+        }
 
         let texture = if let Some(texture) = &self.texture {
             texture
@@ -53,23 +67,29 @@ impl FrameAdapter for SoftwareFrameAdapter {
             } else {
                 unsafe {
                     let mut formats = std::ptr::null_mut();
-                    ff::av_hwframe_transfer_get_formats(
+                    let ret = ff::av_hwframe_transfer_get_formats(
                         frame.hw_frames_ctx,
                         ff::AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_FROM,
                         &mut formats,
                         0,
                     );
+                    if ret != 0 {
+                        eprintln!("[SoftwareFrameAdapter] av_hwframe_transfer_get_formats failed: {}", ret);
+                        return Err(Error::UnsupportedPixelFormat);
+                    }
 
+                    let base = formats;
+                    let mut cursor = formats;
                     let format = loop {
-                        if *formats == ff::AVPixelFormat::AV_PIX_FMT_NONE
-                            || layout::av_pixel_texture_format(*formats).is_some()
+                        if *cursor == ff::AVPixelFormat::AV_PIX_FMT_NONE
+                            || layout::av_pixel_texture_format(*cursor).is_some()
                         {
-                            break *formats;
+                            break *cursor;
                         }
-                        formats = formats.add(1);
+                        cursor = cursor.add(1);
                     };
 
-                    ff::av_free(formats as _);
+                    ff::av_free(base as _);
                     format
                 }
             };
@@ -117,6 +137,7 @@ impl FrameAdapter for SoftwareFrameAdapter {
                 ff::av_hwframe_map(mapped_frame as _, frame as _, ff::AV_HWFRAME_MAP_READ as _)
             };
             if err != 0 {
+                eprintln!("[SoftwareFrameAdapter] av_hwframe_map failed: {}, attempting transfer_data", err);
                 unsafe {
                     let err = ff::av_hwframe_transfer_data(
                         mapped_frame as _,
@@ -125,6 +146,7 @@ impl FrameAdapter for SoftwareFrameAdapter {
                     );
 
                     if err != 0 {
+                        eprintln!("[SoftwareFrameAdapter] av_hwframe_transfer_data failed: {}", err);
                         return Err(Error::UnsupportedPixelFormat);
                     }
                 }
@@ -177,12 +199,12 @@ impl FrameAdapter for SoftwareFrameAdapter {
                 write_texture(u, 1, 1);
                 write_texture(v, 2, 1);
             }
-            layout::PlaneLayout::RGB(_) => todo!(),
+            layout::PlaneLayout::RGB(_) => return Err(Error::UnsupportedPixelFormat),
         }
 
         unsafe { ff::av_frame_unref(self.mapped_frame.as_ptr()) };
 
-        Ok(())
+        Ok(None)
     }
 
     fn layout_identity(&self) -> Option<layout::FrameDescriptor<()>> {
@@ -195,7 +217,33 @@ impl FrameAdapter for SoftwareFrameAdapter {
         self.texture.as_ref().map(|texture| &texture.bg0)
     }
 
+    fn plane_views(&self) -> Option<Vec<wgpu::TextureView>> {
+        self.texture.as_ref().map(|texture| {
+            let views = texture.textures.planes.map(|t, _desc| {
+                t.create_view(&wgpu::TextureViewDescriptor::default())
+            });
+            match views {
+                layout::PlaneLayout::PackedYUV420([y, uv]) => vec![y, uv],
+                layout::PlaneLayout::YUV420([y, u, v]) => vec![y, u, v],
+                layout::PlaneLayout::YUV444([y, u, v]) => vec![y, u, v],
+                layout::PlaneLayout::RGB(plane) => vec![plane],
+            }
+        })
+    }
+
     fn name(&self) -> &'static str {
-        "Software"
+        if self.hw_transfer {
+            "HW decode (CPU transfer)"
+        } else {
+            "Software"
+        }
+    }
+}
+
+impl Drop for SoftwareFrameAdapter {
+    fn drop(&mut self) {
+        unsafe {
+            ff::av_frame_free(&mut self.mapped_frame.as_ptr());
+        }
     }
 }

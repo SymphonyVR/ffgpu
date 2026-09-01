@@ -125,13 +125,6 @@ pub fn vk_format_texture_format(
             planes: PlaneLayout::YUV420([wgpu::TextureFormat::R8Unorm; 3]),
             depth: Depth::D8,
         }),
-        ash::vk::Format::G8_B8R8_2PLANE_444_UNORM => Some(FrameDescriptor {
-            planes: PlaneLayout::PackedYUV420([
-                wgpu::TextureFormat::R8Unorm,
-                wgpu::TextureFormat::Rg8Unorm,
-            ]),
-            depth: Depth::D8,
-        }),
         ash::vk::Format::G8_B8_R8_3PLANE_444_UNORM => Some(FrameDescriptor {
             planes: PlaneLayout::YUV444([wgpu::TextureFormat::R8Unorm; 3]),
             depth: Depth::D8,
@@ -141,11 +134,11 @@ pub fn vk_format_texture_format(
                 wgpu::TextureFormat::R16Unorm,
                 wgpu::TextureFormat::Rg16Unorm,
             ]),
-            depth: Depth::D10,
+            depth: Depth::D16,
         }),
         ash::vk::Format::G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16 => Some(FrameDescriptor {
             planes: PlaneLayout::YUV420([wgpu::TextureFormat::R16Unorm; 3]),
-            depth: Depth::D10,
+            depth: Depth::D16,
         }),
         ash::vk::Format::G16_B16R16_2PLANE_420_UNORM => Some(FrameDescriptor {
             planes: PlaneLayout::PackedYUV420([

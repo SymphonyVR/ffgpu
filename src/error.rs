@@ -13,6 +13,11 @@ pub enum Error {
     UnsupportedPixelFormat,
     UnsupportedBackend,
     Unknown,
+    /// Wraps a string error from the public probe helpers (e.g.
+    /// `probe_hardware_decoding_support`). The string is human-readable
+    /// diagnostics — the caller should treat the error as a non-fatal
+    /// "we don't know" signal and fall back to software decoding.
+    Probe(String),
 }
 
 impl fmt::Display for Error {
@@ -29,6 +34,7 @@ impl fmt::Display for Error {
             Error::UnsupportedPixelFormat => f.write_str("unsupported frame pixel format"),
             Error::UnsupportedBackend => f.write_str("unsupported wgpu backend"),
             Error::Unknown => f.write_str("unknown error"),
+            Error::Probe(msg) => write!(f, "probe error: {}", msg),
         }
     }
 }

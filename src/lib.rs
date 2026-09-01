@@ -1,16 +1,26 @@
-pub(crate) mod context;
+pub mod context;
 pub(crate) mod decode;
 pub(crate) mod error;
+pub(crate) mod probe;
+#[cfg(feature = "video")]
+pub(crate) mod software_video;
 pub(crate) mod video;
 pub(crate) mod vulkan_device;
 
 pub use context::Context;
+pub use context::layout;
 pub use decode::{
     audio::{AudioMetadata, AudioParameters, AudioSink, DeviceAudioSink},
+    video::{DiscardLevel, VideoMetadata},
     vulkan_hwcontext::VulkanDeviceHandles,
-    video::VideoMetadata,
 };
 pub use error::{Error, Result};
+pub use probe::{probe_hardware_decoding_support, probe_software_required};
+#[cfg(feature = "video")]
+pub use software_video::{
+    ColorMatrix, MasterClock, PixelFormat, SoftwareContext, SoftwareDecodeVideo, SoftwareFrame,
+    SoftwareFrameReceiver, SoftwareVideo, YuvRange,
+};
 pub use video::{SeekMode, Video};
 pub use vulkan_device::{VulkanVideoDevice, create_vulkan_device_for_video};
 

@@ -12,8 +12,9 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use ffmpeg_next::{self as ffn, sys as ff};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
+use std::time::Duration;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,31 +24,115 @@ pub(crate) enum PlayState {
     Step,
 }
 
-pub(crate) struct DecoderState {
-    pub metadata: Metadata,
+/// High-level lifecycle of a decoder (Playing/Paused/Stopping/Stopped).
+///
+/// Independent of `play_state` (which only tracks Playing/Paused/Step). The
+/// `kill()` call transitions Active → Stopping and the engine can then call
+/// `wait_to_finish()` to block until every decoder thread has actually
+/// returned. Calling `wait_to_finish()` while still in `Active` state would
+/// deadlock (the threads never observe `alive=false` on their own), so the
+/// function panics — `kill()` must be called first. Mirrors the Kira audio
+/// player's `Stopping/Stopped` pattern.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lifecycle {
+    Active = 0, // Playing or Paused (play_state has the detail)
+    Stopping,   // kill() was called, threads are winding down
+    Stopped,    // all decoder threads have exited
+}
 
-    pub alive: AtomicBool,
+pub(crate) struct DecoderState {
+    pub metadata: ArcSwap<Metadata>,
+
+    /// Shared with the ffmpeg interrupt callback so av_read_frame aborts
+    /// when kill() is called. Wrapped in Arc because the callback's
+    /// closure must be 'static and capture a reference to flip.
+    pub alive: Arc<AtomicBool>,
     pub play_state: AtomicU8,
+    pub lifecycle: AtomicU8,
     pub is_eof: AtomicBool,
     pub current_pts: AtomicI64,
+    pub looping: AtomicBool,
+    pub loop_index: AtomicU64,
+    pub loop_events: Arc<AtomicU64>,
+
+    /// Count of running decoder threads (read, video, audio). Incremented
+    /// in each thread's `run()` before spawn, decremented by a ThreadGuard
+    /// when the thread closure returns. `wait_to_finish` polls this.
+    /// Wrapped in Arc so the guard can be sent across thread boundaries.
+    pub thread_count: Arc<AtomicUsize>,
 
     pub video_stream: ArcSwap<VideoStream>,
     pub audio_stream: ArcSwap<AudioStream>,
+
+    /// Current `AVCodecContext` of the video decoder. The `VideoThread` swaps
+    /// decoders on hwaccel fallback (Vulkan → D3D11VA → software); consumers
+    /// (ffgpu `Video::update`) must read the decoder through this shared
+    /// pointer instead of a pointer captured at open time, which would dangle
+    /// once the thread frees the old context.
+    pub video_decoder: AtomicPtr<ff::AVCodecContext>,
 }
 
 impl DecoderState {
+    /// Create a state with the given metadata and streams. Use this for
+    /// the final construction after decoders are wired up. The `alive`
+    /// flag is freshly initialized.
     pub fn new(metadata: Metadata, video: VideoStream, audio: AudioStream) -> Self {
         DecoderState {
-            metadata,
+            metadata: ArcSwap::new(Arc::new(metadata)),
 
-            alive: AtomicBool::new(true),
+            alive: Arc::new(AtomicBool::new(true)),
             play_state: AtomicU8::new(PlayState::Playing as u8),
+            lifecycle: AtomicU8::new(Lifecycle::Active as u8),
             is_eof: AtomicBool::new(false),
             current_pts: AtomicI64::new(0),
+            looping: AtomicBool::new(false),
+            loop_index: AtomicU64::new(0),
+            loop_events: Arc::new(AtomicU64::new(0)),
+            thread_count: Arc::new(AtomicUsize::new(0)),
 
             video_stream: ArcSwap::new(Arc::new(video)),
             audio_stream: ArcSwap::new(Arc::new(audio)),
+            video_decoder: AtomicPtr::new(std::ptr::null_mut()),
         }
+    }
+
+    /// Create a bare-bones state with default metadata and dummy streams.
+    /// Use this when you need a state *before* the streams are constructed
+    /// (so the state can be passed to `Input::open_with_state` and the
+    /// ffmpeg interrupt callback can be wired to `state.alive`). The
+    /// caller MUST follow up with `set_metadata` + `set_streams` before
+    /// spawning any threads.
+    pub fn empty() -> Self {
+        DecoderState {
+metadata: ArcSwap::new(Arc::new(Metadata {
+                duration: Duration::ZERO,
+                ..Default::default()
+            })),
+
+            alive: Arc::new(AtomicBool::new(true)),
+            play_state: AtomicU8::new(PlayState::Playing as u8),
+            lifecycle: AtomicU8::new(Lifecycle::Active as u8),
+            is_eof: AtomicBool::new(false),
+            current_pts: AtomicI64::new(0),
+            looping: AtomicBool::new(false),
+            loop_index: AtomicU64::new(0),
+            loop_events: Arc::new(AtomicU64::new(0)),
+            thread_count: Arc::new(AtomicUsize::new(0)),
+
+            video_stream: ArcSwap::new(Arc::new(VideoStream::dummy())),
+            audio_stream: ArcSwap::new(Arc::new(AudioStream::dummy())),
+            video_decoder: AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+
+    /// Set the metadata + streams after the Input has been opened with
+    /// the state's `alive` as the ffmpeg interrupt source. Called once
+    /// during initialization.
+    pub fn install(&self, metadata: Metadata, video: VideoStream, audio: AudioStream) {
+        self.metadata.store(Arc::new(metadata));
+        self.video_stream.store(Arc::new(video));
+        self.audio_stream.store(Arc::new(audio));
     }
 
     pub fn play_state(&self) -> PlayState {
@@ -59,19 +144,81 @@ impl DecoderState {
         }
     }
 
+    pub fn lifecycle(&self) -> Lifecycle {
+        match self.lifecycle.load(Ordering::Relaxed) {
+            0 => Lifecycle::Active,
+            1 => Lifecycle::Stopping,
+            2 => Lifecycle::Stopped,
+            _ => Lifecycle::Active,
+        }
+    }
+
     pub fn kill(&self) {
+        // Transition Active → Stopping. Idempotent: re-calling kill() while
+        // already Stopping/Stopped is a no-op.
+        self.lifecycle.store(Lifecycle::Stopping as u8, Ordering::SeqCst);
         self.alive.store(false, Ordering::SeqCst);
+    }
+
+    /// Block until every decoder thread has returned, or `timeout` elapses.
+    /// Returns `true` if all threads finished, `false` on timeout.
+    ///
+    /// **Caller contract:** `kill()` must be called first. Calling this on
+    /// an `Active` decoder would deadlock (the threads never see `alive=false`
+    /// on their own), so we panic loudly to surface the bug.
+    pub fn wait_to_finish(&self, timeout: std::time::Duration) -> bool {
+        match self.lifecycle() {
+            Lifecycle::Stopped => return true,
+            Lifecycle::Active => {
+                panic!(
+                    "ffgpu::DecoderState::wait_to_finish called on Active decoder; \
+                     call kill() first"
+                );
+            }
+            Lifecycle::Stopping => {}
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        while self.thread_count.load(Ordering::Acquire) > 0 {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        self.lifecycle
+            .store(Lifecycle::Stopped as u8, Ordering::SeqCst);
+        true
+    }
+}
+
+/// RAII guard that decrements the decoder's thread counter on drop. Held
+/// inside each decoder thread's closure so the counter goes back to zero
+/// when `run_thread()` returns (normally or via panic).
+pub(crate) struct ThreadGuard(Arc<AtomicUsize>);
+
+impl ThreadGuard {
+    /// Increment `counter` and return a guard that decrements on drop.
+    pub fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        ThreadGuard(counter)
+    }
+}
+
+impl Drop for ThreadGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
 pub(crate) struct PacketQueueMetadata {
     pub duration: AtomicI64,
     pub serial: AtomicU32,
+    pub loop_index: AtomicU64,
 }
 
 pub(crate) struct Packet {
     pub packet: ffn::Packet,
     pub serial: u32,
+    pub loop_index: u64,
 }
 
 #[derive(Clone)]
@@ -89,23 +236,38 @@ impl PacketSender {
             .duration
             .fetch_add(packet.duration(), Ordering::SeqCst);
         let serial = self.metadata.serial.load(Ordering::SeqCst);
-        self.tx.send(Packet { packet, serial }).unwrap();
+        let loop_index = self.metadata.loop_index.load(Ordering::SeqCst);
+        self.tx.send(Packet { packet, serial, loop_index }).unwrap();
     }
 
-    fn push_null(&self, mut packet: ffn::Packet, stream_index: usize) {
+    pub(crate) fn push_null(&self, mut packet: ffn::Packet, stream_index: usize) {
         packet.set_stream(stream_index);
-        self.push(packet);
+        self.metadata
+            .duration
+            .fetch_add(packet.duration(), Ordering::SeqCst);
+        let serial = self.metadata.serial.load(Ordering::SeqCst);
+        let loop_index = self.metadata.loop_index.load(Ordering::SeqCst);
+        let _ = self.tx.send(Packet { packet, serial, loop_index });
     }
 
-    fn has_enough_packets(&self, time_base: ffn::Rational) -> bool {
+    // Packet-count backpressure for the read thread. The old
+    // `buffered duration > 1.0s` term is unreachable for clips shorter than
+    // one second, and ANDing with the audio queue meant a no-audio stream
+    // never throttled the reader at all. Either way a short looping video
+    // grew the unbounded packet queue forever (memory leak). A plain count
+    // bound works for any duration.
+    fn has_enough_packets(&self) -> bool {
         self.tx.len() > Self::MIN_FRAMES
-            && (f64::from(time_base) * self.metadata.duration.load(Ordering::SeqCst) as f64) > 1.0
     }
 
     fn flush(&self) {
         while let Ok(_) = self.rx.try_recv() {}
         self.metadata.duration.store(0, Ordering::SeqCst);
         self.metadata.serial.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn set_loop_index(&self, loop_index: u64) {
+        self.metadata.loop_index.store(loop_index, Ordering::SeqCst);
     }
 }
 
@@ -137,6 +299,7 @@ pub(crate) fn packet_queue() -> (PacketSender, PacketReceiver, Arc<PacketQueueMe
     let metadata = Arc::new(PacketQueueMetadata {
         duration: AtomicI64::new(0),
         serial: AtomicU32::new(0),
+        loop_index: AtomicU64::new(0),
     });
     let (tx, rx) = unbounded();
     let tx = PacketSender {
@@ -187,15 +350,30 @@ impl FrameQueue {
         }
     }
 
-    pub fn send(&self, frame: &mut ffn::Frame, serial: u32) {
-        if let Ok(mut dst) = self.free_rx.recv() {
-            unsafe {
-                ff::av_frame_unref(dst.frame.as_mut_ptr());
-                ff::av_frame_move_ref(dst.frame.as_mut_ptr(), frame.as_mut_ptr());
+    pub fn send(
+        &self,
+        frame: &mut ffn::Frame,
+        serial: u32,
+        alive: &AtomicBool,
+    ) -> bool {
+        let mut dst = loop {
+            match self.free_rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(dst) => break dst,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if !alive.load(Ordering::Relaxed) {
+                        return false;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return false,
             }
-            dst.serial = serial;
-            self.queue_tx.send(dst).unwrap();
+        };
+
+        unsafe {
+            ff::av_frame_unref(dst.frame.as_mut_ptr());
+            ff::av_frame_move_ref(dst.frame.as_mut_ptr(), frame.as_mut_ptr());
         }
+        dst.serial = serial;
+        self.queue_tx.send(dst).is_ok()
     }
 
     pub fn queued_len(&self) -> usize {
@@ -263,11 +441,10 @@ impl Clock {
             if pts.is_nan() { None } else { Some(pts) }
         } else {
             let t = ffn::time::relative() as f64 / 1000000.;
-            Some(
-                self.pts_drift.load(Ordering::Relaxed) + t
-                    - (t - self.last_updated.load(Ordering::Relaxed))
-                        * (1. - self.speed.load(Ordering::Relaxed)),
-            )
+            let pts = self.pts_drift.load(Ordering::Relaxed) + t
+                - (t - self.last_updated.load(Ordering::Relaxed))
+                    * (1. - self.speed.load(Ordering::Relaxed));
+            if pts.is_nan() { None } else { Some(pts) }
         }
     }
 
@@ -281,7 +458,7 @@ impl Clock {
 
     pub fn sync_to_slave(&self, slave: &Clock) {
         let clock = self.get();
-        let slave_clock = self.get();
+        let slave_clock = slave.get();
         if let Some(slave_clock) = slave_clock
             && clock.is_none_or(|clock| (clock - slave_clock).abs() > Clock::NO_SYNC_THRESHOLD)
         {
@@ -293,5 +470,138 @@ impl Clock {
 pub(crate) fn sink_thread(state: Arc<DecoderState>, packets: PacketReceiver) {
     while state.alive.load(Ordering::Relaxed) {
         packets.receive();
+    }
+}
+
+pub(crate) fn loop_timestamp_offset(
+    state: &DecoderState,
+    loop_index: u64,
+    time_base: ffn::Rational,
+) -> i64 {
+    let duration_us = state.metadata.load().duration.as_micros();
+    let total_us = duration_us
+        .saturating_mul(u128::from(loop_index))
+        .min(i64::MAX as u128) as i64;
+
+    unsafe { ff::av_rescale_q(total_us, ff::AV_TIME_BASE_Q, time_base.into()) }
+}
+
+/// Convert a public (start-time-relative) position into the absolute
+/// AV_TIME_BASE timestamp that `avformat_seek_file()` and the decoder
+/// `SkipToTimestamp` messages expect. ffplay contract: `abs = rel +
+/// container.start_time`. A relative position below the origin is clamped
+/// up to it so we never seek before the start of the media.
+pub(crate) fn seek_target_us(state: &DecoderState, position: Duration) -> i64 {
+    let rel = (position.as_secs_f64() * ff::AV_TIME_BASE as f64) as i64;
+    let start = state.metadata.load().start_time;
+    if start != ff::AV_NOPTS_VALUE {
+        rel.saturating_add(start).max(start)
+    } else {
+        rel
+    }
+}
+
+/// Container start offset in seconds for the public timeline (0 when the
+/// format carries none). Public position = decoded absolute PTS (seconds)
+/// minus this value, per the ffplay model.
+pub(crate) fn container_start_seconds(state: &DecoderState) -> f64 {
+    let start = state.metadata.load().start_time;
+    if start != ff::AV_NOPTS_VALUE && start > 0 {
+        start as f64 / ff::AV_TIME_BASE as f64
+    } else {
+        0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DecoderState, PacketSender, audio::AudioStream, packet_queue, read::Metadata, video::VideoStream};
+use ffmpeg_next::Packet;
+    use ffmpeg_next::Rational;
+    use std::time::Duration;
+
+    fn state_with_start_time(start_time: i64) -> DecoderState {
+        let state = DecoderState::empty();
+        state.metadata.store(std::sync::Arc::new(Metadata {
+            duration: Duration::from_secs(120),
+            start_time,
+        }));
+        state
+    }
+
+    #[test]
+    fn seek_target_adds_start_time_and_clamps() {
+        let no_start = state_with_start_time(ffmpeg_next::sys::AV_NOPTS_VALUE);
+        assert_eq!(super::seek_target_us(&no_start, Duration::from_secs(5)), 5_000_000);
+
+        let shifted = state_with_start_time(4_000_000);
+        assert_eq!(super::seek_target_us(&shifted, Duration::from_secs(5)), 9_000_000);
+        // Relative position below the origin is clamped up to the origin.
+        assert_eq!(super::seek_target_us(&shifted, Duration::ZERO), 4_000_000);
+    }
+
+    #[test]
+    fn container_start_seconds_projects_reports_offset_only_when_positive() {
+        assert_eq!(super::container_start_seconds(&state_with_start_time(4_000_000)), 4.0);
+        assert_eq!(super::container_start_seconds(&state_with_start_time(0)), 0.0);
+        assert_eq!(
+            super::container_start_seconds(&state_with_start_time(ffmpeg_next::sys::AV_NOPTS_VALUE)),
+            0.0,
+        );
+    }
+
+    #[test]
+    fn install_publishes_input_duration() {
+        let state = DecoderState::empty();
+        let duration = Duration::from_secs(2142);
+
+state.install(
+            Metadata { duration, ..Default::default() },
+            VideoStream::dummy(),
+            AudioStream::dummy(),
+        );
+
+        assert_eq!(state.metadata.load().duration, duration);
+    }
+
+    #[test]
+    fn loop_timestamp_offset_uses_container_duration() {
+        let state = DecoderState::empty();
+        state
+            .metadata
+            .store(std::sync::Arc::new(Metadata {
+duration: Duration::from_secs(2),
+                ..Default::default()
+            }));
+
+        assert_eq!(
+            super::loop_timestamp_offset(&state, 3, Rational(1, 1)),
+            6,
+        );
+    }
+
+#[test]
+    fn packet_queue_tags_prefetched_loop_packets() {
+        let (sender, receiver, _) = packet_queue();
+        sender.set_loop_index(2);
+        sender.push_null(Packet::empty(), 0);
+
+        assert_eq!(receiver.receive().unwrap().loop_index, 2);
+    }
+
+    #[test]
+    fn has_enough_packets_throttles_by_count_independent_of_duration() {
+        // Regression: the old gate required `buffered duration > 1.0s`, which
+        // is unreachable for clips shorter than one second (and ANDing with
+        // the audio queue meant a no-audio stream never throttled). A short
+        // looping video therefore grew the unbounded packet queue forever.
+        // This is a packet-count bound now, so it must engage regardless of
+        // how short the clip is.
+        let (sender, _receiver, _) = packet_queue();
+        assert!(!sender.has_enough_packets());
+        for _ in 0..(PacketSender::MIN_FRAMES + 1) {
+            sender.push_null(Packet::empty(), 0);
+        }
+        assert!(sender.has_enough_packets());
     }
 }

@@ -83,7 +83,9 @@ impl PipelineCache {
                 };
 
                 let layout_entries: &[_] = match identity.planes {
-                    layout::PlaneLayout::PackedYUV420(_) => &[float_view(0), float_view(1)],
+                    layout::PlaneLayout::PackedYUV420(_) => {
+                        &[float_view(0), float_view(1)]
+                    }
                     layout::PlaneLayout::YUV420(_) | layout::PlaneLayout::YUV444(_) => {
                         &[float_view(0), float_view(1), float_view(2)]
                     }
@@ -108,10 +110,12 @@ impl PipelineCache {
                 let color_matrix = yuv_to_rgb_matrix(color_space);
 
                 let shader_source = match identity.planes {
-                    layout::PlaneLayout::PackedYUV420(_) => include_str!("yuv420_packed.wgsl"),
-                    layout::PlaneLayout::YUV420(_) => include_str!("yuv420.wgsl"),
-                    layout::PlaneLayout::YUV444(_) => include_str!("yuv444.wgsl"),
-                    layout::PlaneLayout::RGB(_) => todo!(),
+                    layout::PlaneLayout::PackedYUV420(_) => {
+                        include_str!("yuv420_packed.wgsl").to_string()
+                    }
+                    layout::PlaneLayout::YUV420(_) => include_str!("yuv420.wgsl").to_string(),
+                    layout::PlaneLayout::YUV444(_) => include_str!("yuv444.wgsl").to_string(),
+                    layout::PlaneLayout::RGB(_) => include_str!("rgb.wgsl").to_string(),
                 };
                 let shader_source = shader_source
                     .replace(
@@ -226,7 +230,16 @@ impl PipelineCache {
                     ],
                 })
             }
-            layout::PlaneLayout::RGB(_) => todo!(),
+            layout::PlaneLayout::RGB(plane) => {
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &bg0_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(plane),
+                    }],
+                })
+            }
         }
     }
 }

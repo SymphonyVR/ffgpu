@@ -1,4 +1,4 @@
-pub(crate) mod layout;
+pub mod layout;
 pub(crate) mod pipeline_cache;
 
 use crate::{
@@ -63,10 +63,15 @@ impl Context {
 
         let pipeline_cache = Arc::new(Mutex::new(PipelineCache::new(device.clone())));
 
-        // Create a shared FFmpeg Vulkan hwdevice context once, so every video
-        // opened through this context uses the same VkDevice as wgpu.
+        // Create a shared FFmpeg Vulkan hwdevice context only when Vulkan Video
+        // decode is actually available (i.e. the renderer successfully created a
+        // device with video decode queue support). When vulkan_video_queue_family_index
+        // is None, Vulkan Video is unavailable and we fall back to D3D11VA on Windows,
+        // which creates its own D3D11 device context via FFmpeg's standard path.
         let vulkan_hw_device_ctx =
-            if adapter.get_info().backend == wgpu::Backend::Vulkan {
+            if adapter.get_info().backend == wgpu::Backend::Vulkan
+                && vulkan_video_queue_family_index.is_some()
+            {
                 let mut handles = unsafe {
                     vulkan_hwcontext::extract_vulkan_device_handles(
                         &instance, &adapter, &device, &queue,
@@ -116,6 +121,29 @@ impl Context {
             self.vulkan_hw_device_ctx.map(|p| NonNull::new(p.0).unwrap()),
             path,
         )
+    }
+
+    /// Create a GPU-backed player without giving FFmpeg a hardware device.
+    /// Software-decoded YUV planes are still uploaded by the frame adapter and
+    /// remain available to the engine's fused GPU renderer.
+    pub fn create_video_software_planes<P>(&mut self, path: &P) -> Result<(Video, AudioSink)>
+    where
+        P: AsRef<Path> + ?Sized,
+    {
+        Video::new_software_planes(
+            self.instance.clone(),
+            self.adapter.clone(),
+            self.device.clone(),
+            self.queue.clone(),
+            self.pipeline_cache.clone(),
+            path,
+        )
+    }
+
+    /// Returns true if a shared FFmpeg Vulkan hardware device context was created,
+    /// meaning Vulkan Video decode is available for use.
+    pub fn has_vulkan_hwctx(&self) -> bool {
+        self.vulkan_hw_device_ctx.is_some()
     }
 }
 

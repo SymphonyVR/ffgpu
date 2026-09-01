@@ -8,6 +8,8 @@ use metal::foreign_types::ForeignType;
 use objc2_core_video as cv;
 use std::ptr::{NonNull, null_mut};
 
+use super::GlInteropTicket;
+
 struct ImportedCVMetalTexture {
     texture_cache: NonNull<cv::CVMetalTextureCache>,
     y_texture: wgpu::Texture,
@@ -238,7 +240,7 @@ impl FrameAdapter for VideoToolboxFrameAdapter {
         queue: &wgpu::Queue,
         _encoder: &mut wgpu::CommandEncoder,
         pipeline_cache: &mut PipelineCache,
-    ) -> Result<()> {
+    ) -> Result<Option<GlInteropTicket>> {
         unsafe {
             let frame = frame.as_mut();
             if frame.data[3].is_null() {
@@ -279,7 +281,7 @@ impl FrameAdapter for VideoToolboxFrameAdapter {
 
             imported_texture.import_cv_buffer(device, queue, pixel_buffer);
 
-            Ok(())
+            Ok(None)
         }
     }
 
