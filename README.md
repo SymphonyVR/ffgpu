@@ -23,18 +23,20 @@ The table below describes the paths implemented in this experimental branch. `GP
 
 | Decode path | **Vulkan** | **DX12** | **Metal** | **OpenGL** | **CPU / no WGPU** |
 |---|---|---|---|---|---|
-| **Vulkan Video (Windows/Linux)** | **Direct sample / GPU-copy fallback** | N/A | N/A | N/A | N/A |
-| **Windows D3D11VA** | Supported interop | **Supported** | N/A | **GPU plane-copy + GL external-memory interop** | N/A |
-| **Linux VA-API / DRM PRIME** | Prefer Vulkan Video on Vulkan backend | N/A | N/A | **Direct EGL/DRM PRIME import** | N/A |
+| **Vulkan Video (Windows/Linux)** | **Experimental — direct sample / GPU-copy fallback** | N/A | N/A | N/A | N/A |
+| **Windows D3D11VA** | **Hardening WIP — explicit cross-API sync required** | **Hardening WIP — explicit cross-API sync required** | N/A | **Experimental — GPU plane-copy + GL external-memory interop** | N/A |
+| **Linux VA-API / DRM PRIME** | Prefer Vulkan Video on Vulkan backend | N/A | N/A | **Experimental — direct EGL/DRM PRIME import** | N/A |
 | **macOS VideoToolbox** | CPU fallback | N/A | **Supported** | CPU fallback | N/A |
 | **Software decode** | CPU upload | CPU upload | CPU upload | CPU upload | **Supported** |
 
-The Vulkan direct-sampling and cross-API OpenGL paths are experimental and should be validated on the target driver/GPU combination before being treated as production-safe.
+The Vulkan direct-sampling and cross-API interop paths are experimental. In particular, the D3D11VA→Vulkan/DX12 paths still require explicit producer/consumer synchronization hardening before they should be treated as production-safe.
 
 ## Work in progress
 
 This library is still incomplete. Important remaining/hardening work includes:
 
+- Explicit D3D11↔Vulkan and D3D11↔DX12 synchronization.
+- Submission-completion tracking for Vulkan Video zero-copy frame release.
 - Wider YUV format coverage and additional 10-bit validation.
 - Hardware integration tests for Vulkan Video and cross-API synchronization.
 - Network streams.
