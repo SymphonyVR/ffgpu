@@ -2,14 +2,17 @@ pub(crate) mod context;
 pub(crate) mod decode;
 pub(crate) mod error;
 pub(crate) mod video;
+pub(crate) mod vulkan_device;
 
 pub use context::Context;
 pub use decode::{
     audio::{AudioMetadata, AudioParameters, AudioSink, DeviceAudioSink},
+    vulkan_hwcontext::VulkanDeviceHandles,
     video::VideoMetadata,
 };
 pub use error::{Error, Result};
 pub use video::{SeekMode, Video};
+pub use vulkan_device::{VulkanVideoDevice, create_vulkan_device_for_video};
 
 #[cfg(target_os = "windows")]
 pub fn required_wgpu_device_features(adapter: &wgpu::Adapter) -> wgpu::Features {
@@ -29,12 +32,19 @@ pub fn required_wgpu_device_features(adapter: &wgpu::Adapter) -> wgpu::Features 
     }
 }
 
-#[cfg(target_os = "macos")]
-pub fn required_wgpu_device_features(_adapter: &wgpu::Adapter) -> wgpu::Features {
-    wgpu::Features::empty()
+#[cfg(target_os = "linux")]
+pub fn required_wgpu_device_features(adapter: &wgpu::Adapter) -> wgpu::Features {
+    match adapter.get_info().backend {
+        wgpu::Backend::Vulkan => {
+            wgpu::Features::TEXTURE_FORMAT_NV12
+                | wgpu::Features::TEXTURE_FORMAT_P010
+                | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+        }
+        _ => wgpu::Features::empty(),
+    }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "macos")]
 pub fn required_wgpu_device_features(_adapter: &wgpu::Adapter) -> wgpu::Features {
     wgpu::Features::empty()
 }

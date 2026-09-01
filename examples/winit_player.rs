@@ -196,7 +196,7 @@ fn main() {
 
                     let mut encoder = device.create_command_encoder(&Default::default());
 
-                    let wait = video.update(&mut encoder).expect("Video::update");
+                    let (wait, _) = video.update(&mut encoder).expect("Video::update");
                     wait_until = now + wait;
                     let stats = video.statistics();
 

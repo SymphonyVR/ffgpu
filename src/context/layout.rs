@@ -102,6 +102,67 @@ pub fn av_pixel_texture_format(
     }
 }
 
+/// Map a Vulkan format to a wgpu texture format descriptor.
+///
+/// This is used by the Vulkan Video zero-copy adapter to determine the plane
+/// layout when importing a raw VkImage.
+pub fn vk_format_texture_format(
+    vk_format: ash::vk::Format,
+    sw_format: ff::AVPixelFormat,
+) -> Option<FrameDescriptor<wgpu::TextureFormat>> {
+    // For multi-planar Vulkan images, we need to know the software pixel format
+    // to determine the number of planes. Some Vulkan formats are themselves
+    // multi-planar (e.g., G8_B8R8_2PLANE_420_UNORM).
+    match vk_format {
+        ash::vk::Format::G8_B8R8_2PLANE_420_UNORM => Some(FrameDescriptor {
+            planes: PlaneLayout::PackedYUV420([
+                wgpu::TextureFormat::R8Unorm,
+                wgpu::TextureFormat::Rg8Unorm,
+            ]),
+            depth: Depth::D8,
+        }),
+        ash::vk::Format::G8_B8_R8_3PLANE_420_UNORM => Some(FrameDescriptor {
+            planes: PlaneLayout::YUV420([wgpu::TextureFormat::R8Unorm; 3]),
+            depth: Depth::D8,
+        }),
+        ash::vk::Format::G8_B8R8_2PLANE_444_UNORM => Some(FrameDescriptor {
+            planes: PlaneLayout::PackedYUV420([
+                wgpu::TextureFormat::R8Unorm,
+                wgpu::TextureFormat::Rg8Unorm,
+            ]),
+            depth: Depth::D8,
+        }),
+        ash::vk::Format::G8_B8_R8_3PLANE_444_UNORM => Some(FrameDescriptor {
+            planes: PlaneLayout::YUV444([wgpu::TextureFormat::R8Unorm; 3]),
+            depth: Depth::D8,
+        }),
+        ash::vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 => Some(FrameDescriptor {
+            planes: PlaneLayout::PackedYUV420([
+                wgpu::TextureFormat::R16Unorm,
+                wgpu::TextureFormat::Rg16Unorm,
+            ]),
+            depth: Depth::D10,
+        }),
+        ash::vk::Format::G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16 => Some(FrameDescriptor {
+            planes: PlaneLayout::YUV420([wgpu::TextureFormat::R16Unorm; 3]),
+            depth: Depth::D10,
+        }),
+        ash::vk::Format::G16_B16R16_2PLANE_420_UNORM => Some(FrameDescriptor {
+            planes: PlaneLayout::PackedYUV420([
+                wgpu::TextureFormat::R16Unorm,
+                wgpu::TextureFormat::Rg16Unorm,
+            ]),
+            depth: Depth::D16,
+        }),
+        ash::vk::Format::G16_B16_R16_3PLANE_420_UNORM => Some(FrameDescriptor {
+            planes: PlaneLayout::YUV420([wgpu::TextureFormat::R16Unorm; 3]),
+            depth: Depth::D16,
+        }),
+        // For single-plane formats, fall back to the software pixel format mapping.
+        _ => av_pixel_texture_format(sw_format),
+    }
+}
+
 fn create_texture(
     device: &wgpu::Device,
     width: u32,

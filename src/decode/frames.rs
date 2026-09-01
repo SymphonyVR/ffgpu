@@ -7,6 +7,8 @@ mod vaapi;
 #[cfg(target_os = "macos")]
 mod video_toolbox;
 
+mod vulkan_video;
+
 use crate::{
     Error, VideoMetadata,
     context::{layout, pipeline_cache::PipelineCache},
@@ -106,6 +108,9 @@ impl FrameDecoder {
                     ff::AVPixelFormat::AV_PIX_FMT_D3D11 => {
                         Box::new(d3d11va::D3D11VAFrameAdapter::new(decoder)?) as _
                     }
+                    ff::AVPixelFormat::AV_PIX_FMT_VULKAN => {
+                        Box::new(vulkan_video::VulkanVideoFrameAdapter::new(decoder)?) as _
+                    }
                     format if software::SoftwareFrameAdapter::supports_format(format) => {
                         log::warn!("using CPU frame copies");
                         Box::new(software::SoftwareFrameAdapter::new(decoder)?) as _
@@ -129,11 +134,21 @@ impl FrameDecoder {
                 &mut *pipeline_cache,
             );
             if let Err(Error::UnsupportedBackend) = res {
-                // don't worry... we can recover from this...
+                // Recover by switching to software (CPU) frame copies.
                 log::error!("unsupported zero-copy WGPU backend");
-                log::warn!("using CPU frame copies");
-                self.adapter = Some(Box::new(software::SoftwareFrameAdapter::new(decoder)?));
-                return Ok(());
+                log::warn!("falling back to CPU frame copies");
+                let mut sw_adapter = Box::new(software::SoftwareFrameAdapter::new(decoder)?);
+                // Import the current frame immediately so we don't skip a cycle.
+                sw_adapter.import_frame(
+                    NonNull::new_unchecked(frame.as_ptr() as *mut _),
+                    instance,
+                    adapter,
+                    device,
+                    queue,
+                    encoder,
+                    &mut *pipeline_cache,
+                )?;
+                self.adapter = Some(sw_adapter);
             } else {
                 res?
             }

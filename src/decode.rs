@@ -1,7 +1,9 @@
 pub(crate) mod audio;
+pub(crate) mod device_monitor;
 pub(crate) mod frames;
 pub(crate) mod read;
 pub(crate) mod video;
+pub(crate) mod vulkan_hwcontext;
 
 use crate::decode::{audio::AudioStream, read::Metadata, video::VideoStream};
 use arc_swap::ArcSwap;

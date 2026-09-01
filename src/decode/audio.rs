@@ -10,7 +10,7 @@ use crossbeam_channel::{Receiver, Sender};
 use ffmpeg_next::{self as ffn, sys as ff};
 use std::{
     mem::ManuallyDrop,
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, atomic::{Ordering, AtomicU32, AtomicU64}},
     thread::JoinHandle,
     time::Duration,
 };
@@ -112,7 +112,6 @@ unsafe impl Sync for Decoder {}
 struct ResamplerState {
     parameters: AudioParameters,
     resampler: ffn::software::resampling::Context,
-    frame: ffn::util::frame::Audio,
 }
 
 pub(crate) struct AudioThread {
@@ -146,7 +145,8 @@ impl AudioThread {
         self.decoder.decoder.flush();
 
         if let Some(resampler) = &mut self.resampler {
-            while let Ok(Some(_)) = resampler.resampler.flush(&mut resampler.frame) {}
+            let mut frame = ffn::util::frame::Audio::empty();
+            while let Ok(Some(_)) = resampler.resampler.flush(&mut frame) {}
         }
     }
 
@@ -177,17 +177,9 @@ impl AudioThread {
                 (format, channel_layout, parameters.sample_rate),
             )?;
 
-            let frame = ffn::util::frame::Audio::new(
-                format,
-                (stream.metadata.frame_size * parameters.sample_rate / stream.metadata.sample_rate)
-                    as _,
-                channel_layout,
-            );
-
             self.resampler = Some(ResamplerState {
                 parameters,
                 resampler,
-                frame,
             });
         }
         Ok(())
@@ -302,25 +294,26 @@ impl AudioThread {
                                 .set_channel_layout(ffn::ChannelLayout::default(channels as _));
                         }
 
+                        let mut resampled_frame = ffn::util::frame::Audio::empty();
                         if let Err(error) =
-                            resampler.resampler.run(&audio_frame, &mut resampler.frame)
+                            resampler.resampler.run(&audio_frame, &mut resampled_frame)
                         {
                             log::error!("audio resampler failed: {}", error);
                         } else {
                             unsafe {
                                 ff::av_frame_unref(audio_frame.as_mut_ptr());
                                 audio_frame.alloc(
-                                    resampler.frame.format(),
-                                    resampler.frame.samples(),
-                                    resampler.frame.channel_layout(),
+                                    resampled_frame.format(),
+                                    resampled_frame.samples(),
+                                    resampled_frame.channel_layout(),
                                 );
                                 ff::av_frame_copy(
                                     audio_frame.as_mut_ptr(),
-                                    resampler.frame.as_mut_ptr(),
+                                    resampled_frame.as_mut_ptr(),
                                 );
                                 ff::av_frame_copy_props(
                                     audio_frame.as_mut_ptr(),
-                                    resampler.frame.as_mut_ptr(),
+                                    resampled_frame.as_mut_ptr(),
                                 );
                                 audio_frame.set_pts(Some(resampled_pts));
                             }
@@ -350,8 +343,15 @@ impl AudioThread {
                 }
             };
 
-            if let Err(error) = self.decoder.decoder.send_packet(&packet.packet) {
-                log::error!("failed to send packet: {}", error);
+            let is_eof_packet = packet.packet.data().is_none();
+            if is_eof_packet {
+                if let Err(error) = self.decoder.decoder.send_eof() {
+                    log::error!("failed to send EOF to audio decoder: {}", error);
+                }
+            } else {
+                if let Err(error) = self.decoder.decoder.send_packet(&packet.packet) {
+                    log::error!("failed to send packet: {}", error);
+                }
             }
         }
     }
@@ -363,16 +363,25 @@ impl AudioThread {
     }
 }
 
+#[derive(Debug, Clone)]
+struct AudioClockAnchor {
+    pts: f64,
+    write_count: u64,
+    serial: u32,
+}
+
 pub struct AudioSink {
     state: Arc<DecoderState>,
-    frame_queue: FrameQueue,
     messages: Sender<Message>,
     parameters: AudioParameters,
     queue: Arc<PacketQueueMetadata>,
     clock: Arc<Clock>,
-    last_pts: f64,
-    last_serial: u32,
-    samples: Vec<f32>,
+    consumer: ringbuf::HeapCons<f32>,
+    last_pts: Arc<AtomicU64>,
+    last_serial: Arc<AtomicU32>,
+    write_count: Arc<AtomicU64>,
+    read_count: Arc<AtomicU64>,
+    anchor: Arc<arc_swap::ArcSwap<AudioClockAnchor>>,
 }
 
 impl AudioSink {
@@ -383,9 +392,125 @@ impl AudioSink {
         queue: Arc<PacketQueueMetadata>,
         clock: Arc<Clock>,
     ) -> Self {
+        use ringbuf::traits::{Producer, Split, Observer};
+        
+        // 2 seconds buffer for 48kHz stereo
+        let rb = ringbuf::HeapRb::<f32>::new(48000 * 2 * 2); 
+        let (mut prod, cons) = rb.split();
+        
+        let last_pts = Arc::new(AtomicU64::new(f64::NAN.to_bits()));
+        let last_serial = Arc::new(AtomicU32::new(u32::MAX));
+        let write_count = Arc::new(AtomicU64::new(0));
+        let read_count = Arc::new(AtomicU64::new(0));
+        let anchor = Arc::new(arc_swap::ArcSwap::new(Arc::new(AudioClockAnchor {
+            pts: f64::NAN,
+            write_count: 0,
+            serial: u32::MAX,
+        })));
+
+        let last_pts_clone = last_pts.clone();
+        let last_serial_clone = last_serial.clone();
+        let write_count_clone = write_count.clone();
+        let read_count_clone = read_count.clone();
+        let anchor_clone = anchor.clone();
+        let state_clone = pbs.clone();
+        let queue_clone = queue.clone();
+        
+        // Background thread to continuously pull decoded frames into the lock-free ringbuffer
+        std::thread::spawn(move || {
+            let mut last_serial = u32::MAX;
+            let mut local_write_count = 0u64;
+
+            while state_clone.alive.load(Ordering::Relaxed) {
+                if state_clone.play_state() == PlayState::Paused {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+
+                // Pacing: only pull frame if we have < 100ms buffered
+                let rate = state_clone.audio_stream.load().metadata.sample_rate;
+                let channels = state_clone.audio_stream.load().metadata.channels;
+                
+                // Target fill: 100ms of audio (keeps latency low)
+                let target_fill_samples = (rate * channels as u32 / 10) as usize;
+                
+                let fill_level = prod.occupied_len();
+                if fill_level >= target_fill_samples {
+                    // Buffer is full enough, sleep and check again
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+
+                let Some(frame) = frame_queue.try_next() else {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                };
+
+                let serial = frame.serial;
+                if serial != queue_clone.serial.load(Ordering::Relaxed) {
+                    frame_queue.release(frame);
+                    continue;
+                }
+
+                // Reset counts on seek/serial change
+                if serial != last_serial {
+                    read_count_clone.store(0, Ordering::SeqCst);
+                    write_count_clone.store(0, Ordering::SeqCst);
+                    local_write_count = 0;
+                    last_serial = serial;
+                }
+
+                let mut frame = ManuallyDrop::new(ffn::util::frame::Audio::from(frame.frame));
+                
+                let pts = if let Some(pts) = frame.pts() {
+                    pts as f64 * f64::from(state_clone.audio_stream.load().metadata.time_base)
+                        + frame.samples() as f64 / frame.rate() as f64
+                } else {
+                    f64::NAN
+                };
+
+                // Discard trailing padding bytes by slicing precisely using frame.samples() * frame.channels()
+                let num_samples = frame.samples() * frame.channels() as usize;
+                let samples_ptr = frame.data(0).as_ptr() as *const f32;
+                let samples = unsafe { std::slice::from_raw_parts(samples_ptr, num_samples) };
+
+                let mut pushed = 0;
+                while pushed < samples.len() && state_clone.alive.load(Ordering::Relaxed) {
+                    let current_serial = queue_clone.serial.load(Ordering::Relaxed);
+                    if serial != current_serial {
+                        break;
+                    }
+                    
+                    let n = prod.push_slice(&samples[pushed..]);
+                    pushed += n;
+                    if pushed < samples.len() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+
+                if pushed == samples.len() {
+                    local_write_count += pushed as u64;
+                    write_count_clone.store(local_write_count, Ordering::SeqCst);
+                    last_pts_clone.store(pts.to_bits(), Ordering::SeqCst);
+                    last_serial_clone.store(serial, Ordering::SeqCst);
+                    
+                    // Update anchor atomically
+                    anchor_clone.store(Arc::new(AudioClockAnchor {
+                        pts,
+                        write_count: local_write_count,
+                        serial,
+                    }));
+                }
+
+                frame_queue.release(Frame {
+                    frame: unsafe { ffn::Frame::wrap(frame.as_mut_ptr()) },
+                    serial,
+                });
+            }
+        });
+
         let mut sink = AudioSink {
             state: pbs,
-            frame_queue,
             messages,
             parameters: AudioParameters {
                 sample_rate: 0,
@@ -393,9 +518,12 @@ impl AudioSink {
             },
             queue,
             clock,
-            last_pts: 0.,
-            last_serial: 0,
-            samples: vec![],
+            consumer: cons,
+            last_pts,
+            last_serial,
+            write_count,
+            read_count,
+            anchor,
         };
         sink.set_parameters(AudioParameters {
             sample_rate: 48000,
@@ -427,8 +555,8 @@ impl AudioSink {
     }
 
     pub fn read_to_slice(&mut self, out: &mut [f32], gain: f32) -> Result<()> {
+        use ringbuf::traits::Consumer;
         let gain = gain.max(0.);
-
         out.fill(0.);
 
         let time = ffn::time::relative() as f64 / 1000000.;
@@ -437,127 +565,425 @@ impl AudioSink {
             return Ok(());
         }
 
-        while self.samples.len() < out.len() {
-            let Some(frame) = self.frame_queue.try_next() else {
-                return Ok(());
-            };
-
-            let serial = frame.serial;
-            if serial != self.queue.serial.load(Ordering::Relaxed) {
-                self.frame_queue.release(frame);
-                continue;
-            }
-
-            let mut frame = ManuallyDrop::new(ffn::util::frame::Audio::from(frame.frame));
-
-            let format = ffn::format::Sample::F32(ffn::format::sample::Type::Packed);
-
-            if frame.rate() != self.parameters.sample_rate
-                || frame.format() != format
-                || frame.channels() != self.parameters.channels
-            {
-                log::warn!("audio frame does not match requested audio parameters, discarding");
-                unsafe { ff::av_frame_unref(frame.as_mut_ptr()) };
-                self.frame_queue.release(Frame {
-                    frame: unsafe { ffn::Frame::wrap(frame.as_mut_ptr()) },
-                    serial,
-                });
-                return Ok(());
-            }
-
-            self.last_pts = if let Some(pts) = frame.pts() {
-                pts as f64 * f64::from(self.state.audio_stream.load().metadata.time_base)
-                    + frame.samples() as f64 / frame.rate() as f64
-            } else {
-                f64::NAN
-            };
-            self.last_serial = serial;
-
-            let (_, samples, _) = unsafe { frame.data(0).align_to::<f32>() };
-            self.samples.extend_from_slice(samples);
-
-            self.frame_queue.release(Frame {
-                frame: unsafe { ffn::Frame::wrap(frame.as_mut_ptr()) },
-                serial,
-            });
+        let current_serial = self.queue.serial.load(Ordering::Relaxed);
+        let active_serial = self.last_serial.load(Ordering::Relaxed);
+        
+        if active_serial != current_serial {
+            // Drop audio if we are seeking
+            return Ok(());
         }
 
-        for (i, x) in self.samples.drain(..out.len()).enumerate() {
-            out[i] = x * gain;
+        let popped = self.consumer.pop_slice(out);
+        
+        for i in 0..popped {
+            out[i] *= gain;
         }
 
-        if !self.last_pts.is_nan() {
-            // last_pts tells us the pts at the very end of self.samples
-            // so the current pts (where the audio sink is currently at)
-            // is the last_pts - buffered (unread) samples duration
-            let target_rate = self.parameters.sample_rate * self.parameters.channels as u32;
-            self.clock.set(
-                self.last_pts - self.samples.len() as f64 / target_rate as f64,
-                self.last_serial,
-                Some(time),
-            );
+        self.read_count.fetch_add(popped as u64, Ordering::SeqCst);
+
+        // FIX: only update the clock when we actually consumed audio.
+        // On underflow (popped < out.len()), the clock must not advance,
+        // otherwise it drifts ahead of real audio at wall-clock rate.
+        if popped > 0 {
+            let anchor = self.anchor.load();
+            if anchor.serial == current_serial && !anchor.pts.is_nan() {
+                let r_count = self.read_count.load(Ordering::SeqCst);
+                let unread = anchor.write_count.saturating_sub(r_count);
+                let target_rate = self.parameters.sample_rate * self.parameters.channels as u32;
+                self.clock.set(
+                    anchor.pts - unread as f64 / target_rate as f64,
+                    current_serial,
+                    Some(time),
+                );
+            }
         }
 
         Ok(())
     }
 
+
+    /// Convert this `AudioSink` into a device-backed, self-healing `DeviceAudioSink`.
+    ///
+    /// - Wraps the ring-buffer consumer in `Arc<Mutex<…>>` so CPAL stream callbacks
+    ///   can be recreated without touching the producer thread.
+    /// - Spawns a background monitor that detects default-device changes via both
+    ///   native OS notifications and a CPAL name-comparison fallback.
+    /// - On device change or stream error: flushes stale samples, sends
+    ///   `Message::UpdateParameters` to the FFmpeg SWR resampler, and rebuilds
+    ///   the CPAL stream — zero producer-side interruption.
     #[cfg(feature = "cpal")]
-    pub fn into_device_sink(mut self) -> DeviceAudioSink {
+    pub fn into_device_sink(self) -> DeviceAudioSink {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicBool;
 
-        let device = cpal::default_host()
-            .default_output_device()
-            .expect("default cpal output");
-        let config = device
-            .default_output_config()
-            .expect("default cpal output config");
+        // Wrap the consumer so multiple stream generations can share it.
+        let consumer = Arc::new(Mutex::new(self.consumer));
+        let gain     = Arc::new(AtomicF32::new(1.0));
+        let alive    = Arc::new(AtomicBool::new(false));
+        let stream   = Arc::new(Mutex::new(None::<cpal::Stream>));
 
-        self.set_parameters(AudioParameters {
-            sample_rate: config.sample_rate(),
-            channels: config.channels(),
+        // Build the initial CPAL stream.
+        match build_cpal_stream(
+            &self.state,
+            &self.messages,
+            &consumer,
+            &gain,
+            &self.last_pts,
+            &self.clock,
+            &self.last_serial,
+            &self.write_count,
+            &self.read_count,
+            &self.anchor,
+        ) {
+            Ok(s) => {
+                *stream.lock().unwrap() = Some(s);
+                alive.store(true, Ordering::Relaxed);
+            }
+            Err(e) => log::error!("[Audio] Failed to build initial CPAL stream: {}", e),
+        }
+
+        // Kick off the native OS device monitor (one global thread per process).
+        super::device_monitor::start_device_monitor();
+
+        // ── monitor thread ────────────────────────────────────────────────────
+        let stop      = Arc::new(AtomicBool::new(false));
+        let stop_c    = stop.clone();
+        let stream_c  = stream.clone();
+        let alive_c   = alive.clone();
+        let state_c   = self.state.clone();
+        let msgs_c    = self.messages.clone();
+        let consumer_c = consumer.clone();
+        let gain_c    = gain.clone();
+        let last_pts_c   = self.last_pts.clone();
+        let clock_c      = self.clock.clone();
+        let last_serial_c = self.last_serial.clone();
+        let write_count_c = self.write_count.clone();
+        let read_count_c = self.read_count.clone();
+        let anchor_c = self.anchor.clone();
+
+        let monitor = std::thread::spawn(move || {
+            // Fallback: remember the device name so we detect changes without
+            // a native listener (e.g. on unsupported platforms or if COM fails).
+            let mut last_name: Option<String> = cpal::default_host()
+                .default_output_device()
+                .and_then(|d| d.description().ok().map(|desc| desc.name().to_string()));
+
+            loop {
+                // Interruptible sleep: 5 × 100 ms so Drop exits quickly.
+                for _ in 0..5 {
+                    if stop_c.load(Ordering::Relaxed) { return; }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+
+                // Stop if the whole player was killed.
+                if !state_c.alive.load(Ordering::Relaxed) { break; }
+
+                // ── detect change ─────────────────────────────────────────────
+                let native_changed   = super::device_monitor::audio_device_changed();
+                let current_name: Option<String> = cpal::default_host()
+                    .default_output_device()
+                    .and_then(|d| d.description().ok().map(|desc| desc.name().to_string()));
+                let fallback_changed = current_name != last_name;
+                let stream_dead      = !alive_c.load(Ordering::Relaxed)
+                    || stream_c.lock().unwrap().is_none();
+
+                if !native_changed && !fallback_changed && !stream_dead {
+                    continue;
+                }
+
+                log::info!(
+                     "[Audio] Device change detected (native={}, name={}, dead={}). Rebuilding stream…",
+                     native_changed, fallback_changed, stream_dead
+                );
+                last_name = current_name;
+
+                // ── stop old stream ───────────────────────────────────────────
+                if let Some(old) = stream_c.lock().unwrap().take() {
+                    let _ = old.pause();
+                }
+                alive_c.store(false, Ordering::Relaxed);
+
+                // ── flush stale samples from the ring buffer ─────────────────
+                // Mandatory: old-rate samples must not reach the new stream.
+                {
+                    use ringbuf::traits::Consumer;
+                    let mut cons = consumer_c.lock().unwrap();
+                    while cons.try_pop().is_some() {}
+                }
+
+                // ── rebuild ───────────────────────────────────────────────────
+                match build_cpal_stream(
+                    &state_c,
+                    &msgs_c,
+                    &consumer_c,
+                    &gain_c,
+                    &last_pts_c,
+                    &clock_c,
+                    &last_serial_c,
+                    &write_count_c,
+                    &read_count_c,
+                    &anchor_c,
+                ) {
+                    Ok(new_stream) => {
+                        log::info!("[Audio] CPAL stream successfully rebuilt");
+                        *stream_c.lock().unwrap() = Some(new_stream);
+                        alive_c.store(true, Ordering::Relaxed);
+                    }
+                    Err(e) => log::error!("[Audio] Failed to rebuild CPAL stream: {}", e),
+                }
+            }
         });
 
-        let gain = Arc::new(AtomicF32::new(1.));
-
-        let stream = {
-            let gain = gain.clone();
-            device
-                .build_output_stream(
-                    &config.config(),
-                    move |data: &mut [f32], _| {
-                        if let Err(error) = self.read_to_slice(data, gain.load(Ordering::Relaxed)) {
-                            log::error!("failed to read audio samples: {}", error);
-                        }
-                    },
-                    |err| {
-                        log::error!("cpal device encountered an error: {}", err);
-                    },
-                    None,
-                )
-                .expect("cpal output stream")
-        };
-
-        stream.play().expect("play cpal stream");
-
         DeviceAudioSink {
-            _stream: stream,
+            state: self.state,
+            messages: self.messages,
+            clock: self.clock,
+            queue: self.queue,
+            consumer,
+            last_pts: self.last_pts,
+            last_serial: self.last_serial,
+            write_count: self.write_count,
+            read_count: self.read_count,
+            anchor: self.anchor,
             gain,
+            stream,
+            alive,
+            monitor: Some(monitor),
+            stop,
         }
     }
 }
 
+// ── Free helper: negotiate device format, update resampler, build stream ──────
+
 #[cfg(feature = "cpal")]
-pub struct DeviceAudioSink {
-    _stream: cpal::Stream,
-    gain: Arc<AtomicF32>,
+fn build_cpal_stream(
+    state:       &Arc<crate::decode::DecoderState>,
+    messages:    &crossbeam_channel::Sender<Message>,
+    consumer:    &Arc<std::sync::Mutex<ringbuf::HeapCons<f32>>>,
+    gain:        &Arc<AtomicF32>,
+    _last_pts:    &Arc<AtomicU64>,
+    clock:       &Arc<crate::decode::Clock>,
+    last_serial: &Arc<AtomicU32>,
+    _write_count: &Arc<AtomicU64>,
+    read_count:  &Arc<AtomicU64>,
+    anchor:      &Arc<arc_swap::ArcSwap<AudioClockAnchor>>,
+) -> crate::error::Result<cpal::Stream> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+    let device = cpal::default_host()
+        .default_output_device()
+        .ok_or(crate::error::Error::Unknown)?;
+
+    let config = device
+        .default_output_config()
+        .map_err(|_| crate::error::Error::Unknown)?;
+
+    let sample_rate = config.sample_rate();
+    let channels    = config.channels() as u16;
+
+    // Tell the FFmpeg SWR resampler to target the new device format.
+    // AudioThread will rebuild its resampler context on the next loop tick.
+    let _ = messages.send(Message::UpdateParameters(AudioParameters {
+        sample_rate,
+        channels,
+    }));
+
+    // ── build the output callback ─────────────────────────────────────────────
+    let consumer_cb    = consumer.clone();
+    let gain_cb        = gain.clone();
+    let clock_cb       = clock.clone();
+    let last_serial_cb = last_serial.clone();
+    let state_cb       = state.clone();
+    let read_count_cb  = read_count.clone();
+    let anchor_cb      = anchor.clone();
+    let target_rate    = sample_rate * channels as u32;
+
+    let read_samples = move |out: &mut [f32]| {
+        use ringbuf::traits::Consumer;
+
+        out.fill(0.0);
+
+        if state_cb.play_state() == crate::decode::PlayState::Paused {
+            return;
+        }
+
+        let g = gain_cb.load(Ordering::Relaxed).max(0.0);
+        let mut cons = consumer_cb.lock().unwrap();
+
+        let popped = cons.pop_slice(out);
+        for s in out[..popped].iter_mut() {
+            *s *= g;
+        }
+
+        read_count_cb.fetch_add(popped as u64, Ordering::SeqCst);
+
+        // FIX: only update the clock when we actually consumed audio.
+        // On underflow (popped < out.len()), the clock must not advance,
+        // otherwise it drifts ahead of real audio at wall-clock rate.
+        if popped > 0 {
+            let anchor = anchor_cb.load();
+            let serial = last_serial_cb.load(Ordering::Relaxed);
+            if anchor.serial == serial && !anchor.pts.is_nan() {
+                let r_count = read_count_cb.load(Ordering::SeqCst);
+                let unread = anchor.write_count.saturating_sub(r_count);
+                let time = ffmpeg_next::time::relative() as f64 / 1_000_000.0;
+                clock_cb.set(
+                    anchor.pts - unread as f64 / target_rate as f64,
+                    serial,
+                    Some(time),
+                );
+            }
+        }
+    };
+
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::F32 => device.build_output_stream(
+            &config.config(),
+            move |data: &mut [f32], _| read_samples(data),
+            |e| log::error!("[Audio] CPAL error: {e}"),
+            None,
+        ),
+        cpal::SampleFormat::I16 => {
+            let mut buf = Vec::<f32>::new();
+            device.build_output_stream(
+                &config.config(),
+                move |data: &mut [i16], _| {
+                    buf.resize(data.len(), 0.0);
+                    read_samples(&mut buf);
+                    for (d, &s) in data.iter_mut().zip(buf.iter()) {
+                        *d = cpal::Sample::from_sample(s);
+                    }
+                },
+                |e| log::error!("[Audio] CPAL error: {e}"),
+                None,
+            )
+        }
+        other => {
+            log::warn!("[Audio] Unsupported CPAL format {other:?}, falling back to f32");
+            device.build_output_stream(
+                &config.config(),
+                move |data: &mut [f32], _| read_samples(data),
+                |e| log::error!("[Audio] CPAL error: {e}"),
+                None,
+            )
+        }
+    }
+    .map_err(|_| crate::error::Error::Unknown)?;
+
+    stream
+        .play()
+        .map_err(|_| crate::error::Error::Unknown)?;
+
+    Ok(stream)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "cpal")]
+pub struct DeviceAudioSink {
+    // Shared context needed to rebuild the stream on device change.
+    state:       Arc<crate::decode::DecoderState>,
+    messages:    crossbeam_channel::Sender<Message>,
+    clock:       Arc<crate::decode::Clock>,
+    queue:       Arc<crate::decode::PacketQueueMetadata>,
+    consumer:    Arc<std::sync::Mutex<ringbuf::HeapCons<f32>>>,
+    last_pts:    Arc<AtomicU64>,
+    last_serial: Arc<AtomicU32>,
+    write_count: Arc<AtomicU64>,
+    read_count:  Arc<AtomicU64>,
+    anchor:      Arc<arc_swap::ArcSwap<AudioClockAnchor>>,
+
+    // Atomically shared gain applied inside the CPAL callback.
+    gain: Arc<AtomicF32>,
+
+    // Active CPAL stream (None while being rebuilt).
+    stream: Arc<std::sync::Mutex<Option<cpal::Stream>>>,
+    // True while the stream is playing and healthy.
+    alive:  Arc<std::sync::atomic::AtomicBool>,
+
+    // Background monitor thread control.
+    monitor: Option<std::thread::JoinHandle<()>>,
+    stop:    Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "cpal")]
 impl DeviceAudioSink {
+    /// Volume multiplier for the CPAL output callback (0.0 = mute, 1.0 = unity).
     pub fn set_gain(&self, gain: f32) {
-        self.gain.store(gain.max(0.), Ordering::Relaxed);
+        self.gain.store(gain.max(0.0), Ordering::Relaxed);
     }
 
     pub fn gain(&self) -> f32 {
         self.gain.load(Ordering::Relaxed)
     }
+
+    /// Returns `true` when the CPAL stream is active and playing.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Manually trigger stream recreation (e.g. after caller detects a problem).
+    /// Returns `true` if the rebuild succeeded.
+    pub fn try_recreate(&self) -> bool {
+        use cpal::traits::StreamTrait;
+        use ringbuf::traits::Consumer;
+
+        if self.is_alive() {
+            return true;
+        }
+
+        // Stop and drop the old stream.
+        if let Some(old) = self.stream.lock().unwrap().take() {
+            let _ = old.pause();
+        }
+
+        // Flush stale samples before switching format.
+        {
+            let mut cons = self.consumer.lock().unwrap();
+            while cons.try_pop().is_some() {}
+        }
+
+        match build_cpal_stream(
+            &self.state,
+            &self.messages,
+            &self.consumer,
+            &self.gain,
+            &self.last_pts,
+            &self.clock,
+            &self.last_serial,
+            &self.write_count,
+            &self.read_count,
+            &self.anchor,
+        ) {
+            Ok(s) => {
+                *self.stream.lock().unwrap() = Some(s);
+                self.alive.store(true, Ordering::Relaxed);
+                true
+            }
+            Err(e) => {
+                log::error!("[Audio] try_recreate failed: {e}");
+                false
+            }
+        }
+    }
 }
+
+#[cfg(feature = "cpal")]
+impl Drop for DeviceAudioSink {
+    fn drop(&mut self) {
+        // Signal the monitor thread to exit.
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.monitor.take() {
+            // The thread sleeps in 100 ms intervals, so this joins in ≤100 ms.
+            let _ = t.join();
+        }
+        // Pause and drop the active stream.
+        if let Some(s) = self.stream.lock().unwrap().take() {
+            use cpal::traits::StreamTrait;
+            let _ = s.pause();
+        }
+    }
+}
+

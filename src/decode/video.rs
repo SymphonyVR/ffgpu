@@ -83,6 +83,7 @@ impl Decoder {
     pub fn new(
         input: &mut ffn::format::context::Input,
         device_type: ff::AVHWDeviceType,
+        hw_device_ctx: Option<NonNull<ff::AVBufferRef>>,
     ) -> Result<Self> {
         let video_stream = input
             .streams()
@@ -138,12 +139,15 @@ impl Decoder {
                     (*decoder_ctx.as_mut_ptr()).get_format = Some(get_hw_format);
                 };
 
-                let mut hwctx = null_mut();
-                unsafe {
-                    ff::av_hwdevice_ctx_create(&mut hwctx, device_type, null_mut(), null_mut(), 0)
+                let hwctx = if let Some(ctx) = hw_device_ctx {
+                    ctx
+                } else {
+                    let mut hwctx = null_mut();
+                    unsafe {
+                        ff::av_hwdevice_ctx_create(&mut hwctx, device_type, null_mut(), null_mut(), 0)
+                    };
+                    NonNull::new(hwctx).ok_or(Error::HardwareContext)?
                 };
-
-                let hwctx = NonNull::new(hwctx).ok_or(Error::HardwareContext)?;
                 unsafe {
                     (*decoder_ctx.as_mut_ptr()).hw_device_ctx = ff::av_buffer_ref(hwctx.as_ptr());
                 }
@@ -219,23 +223,26 @@ impl VideoThread {
     }
 
     fn run_thread(&mut self) {
+        eprintln!("[VideoThread] STARTED — device_type={:?}", self.decoder.device_type);
         let mut packet_serial = 0;
 
         let mut frame = unsafe { ffn::Frame::empty() };
 
         let mut skip_to_ts = None;
+        let mut diag_count: u32 = 0;
 
         'exit: while self.state.alive.load(Ordering::Relaxed) {
             if self.decoder.device_type != ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE
                 && self.decoder.unsupported.load(Ordering::Relaxed)
             {
+                eprintln!("[VideoThread] unsupported codec, falling back to software");
                 log::error!("unsupported codec, falling back to software");
                 let mut input = unsafe {
                     ManuallyDrop::new(ffn::format::context::Input::wrap(
                         self.decoder.format_ctx.as_ptr(),
                     ))
                 };
-                self.decoder = Decoder::new(&mut input, ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE).unwrap(/* was already ok first time */);
+                self.decoder = Decoder::new(&mut input, ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE, None).unwrap(/* was already ok first time */);
             }
 
             while let Ok(message) = self.messages.try_recv() {
@@ -256,6 +263,11 @@ impl VideoThread {
 
                 let frame = match self.decoder.decoder.receive_frame(&mut frame) {
                     Ok(_) => {
+                        if diag_count < 20 {
+                            diag_count += 1;
+                            let fmt = unsafe { (*frame.as_ptr()).format };
+                            eprintln!("[VideoThread] receive_frame OK: format={} (VULKAN={})", fmt, ff::AVPixelFormat::AV_PIX_FMT_VULKAN as i32);
+                        }
                         if let Some(pts) = frame.pts() {
                             let av_pts = unsafe {
                                 ff::av_rescale_q(
@@ -285,21 +297,13 @@ impl VideoThread {
                             }
 
                             let pts_sec = pts as f64 * f64::from(self.decoder.metadata.time_base);
-                            if let Some(master) = self.master_clock.get() {
-                                // drop early frame
-                                let diff = pts_sec - master;
-                                if diff.abs() < Clock::NO_SYNC_THRESHOLD
-                                    && diff < 0.
-                                    && packet_serial == self.clock.serial.load(Ordering::Relaxed)
-                                    && !self.video_rx.rx.is_empty()
-                                {
-                                    continue;
-                                }
-                            }
+
+
                         }
                         Some(&mut frame)
                     }
                     Err(ffn::Error::Eof) => {
+                        if diag_count < 20 { eprintln!("[VideoThread] receive_frame EOF"); }
                         if let Some(mut prev_frame) = prev_frame.take() {
                             unsafe {
                                 ff::av_frame_move_ref(frame.as_mut_ptr(), prev_frame.as_mut_ptr())
@@ -311,9 +315,16 @@ impl VideoThread {
                         }
                     }
                     Err(ffn::Error::Other { errno: ff::EAGAIN }) => {
+                        if diag_count < 20 { eprintln!("[VideoThread] receive_frame EAGAIN"); }
                         break;
                     }
-                    _ => None,
+                    Err(ref e) => {
+                        if diag_count < 20 {
+                            diag_count += 1;
+                            eprintln!("[VideoThread] receive_frame ERROR: {:?}", e);
+                        }
+                        None
+                    }
                 };
 
                 if let Some(frame) = frame {
@@ -356,8 +367,26 @@ impl VideoThread {
                 }
             };
 
-            if let Err(error) = self.decoder.decoder.send_packet(&packet.packet) {
-                log::error!("failed to send packet: {}", error);
+            let is_eof_packet = packet.packet.data().is_none();
+            if diag_count < 20 {
+                diag_count += 1;
+                eprintln!("[VideoThread] send_packet: eof={} serial={}", is_eof_packet, packet.serial);
+            }
+            if is_eof_packet {
+                if let Err(error) = self.decoder.decoder.send_eof() {
+                    eprintln!("[VideoThread] send_eof ERROR: {}", error);
+                    log::error!("failed to send EOF to video decoder: {}", error);
+                }
+            } else {
+                eprintln!("[VideoThread] calling send_packet...");
+                if let Err(error) = self.decoder.decoder.send_packet(&packet.packet) {
+                    eprintln!("[VideoThread] send_packet ERROR: {}", error);
+                    log::error!("failed to send packet: {}", error);
+                }
+                eprintln!("[VideoThread] send_packet returned OK");
+            }
+            if diag_count < 20 {
+                eprintln!("[VideoThread] send_packet done, looping back");
             }
         }
     }

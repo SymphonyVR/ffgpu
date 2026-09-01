@@ -34,18 +34,25 @@ enum FrameResponse {
 }
 
 #[cfg(target_os = "windows")]
-fn preferred_device_type() -> ff::AVHWDeviceType {
-    ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA
+fn preferred_device_type_for_backend(backend: wgpu::Backend) -> ff::AVHWDeviceType {
+    match backend {
+        wgpu::Backend::Vulkan => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+        wgpu::Backend::Dx12 => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+        _ => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn preferred_device_type() -> ff::AVHWDeviceType {
+fn preferred_device_type_for_backend(_backend: wgpu::Backend) -> ff::AVHWDeviceType {
     ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX
 }
 
 #[cfg(target_os = "linux")]
-fn preferred_device_type() -> ff::AVHWDeviceType {
-    ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI
+fn preferred_device_type_for_backend(backend: wgpu::Backend) -> ff::AVHWDeviceType {
+    match backend {
+        wgpu::Backend::Vulkan => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+        _ => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+    }
 }
 
 pub struct Statistics {
@@ -88,6 +95,7 @@ impl Video {
         device: wgpu::Device,
         queue: wgpu::Queue,
         pipeline_cache: Arc<Mutex<PipelineCache>>,
+        hw_device_ctx: Option<NonNull<ff::AVBufferRef>>,
         path: &P,
     ) -> Result<(Self, AudioSink)>
     where
@@ -95,7 +103,11 @@ impl Video {
     {
         let mut input = Input::open(path)?;
 
-        let video_decoder = video::Decoder::new(&mut input.format_ctx, preferred_device_type())?;
+        let backend = adapter.get_info().backend;
+        let device_type = preferred_device_type_for_backend(backend);
+
+        let video_decoder =
+            video::Decoder::new(&mut input.format_ctx, device_type, hw_device_ctx)?;
         let audio_decoder = audio::Decoder::new(&mut input)?;
         let frame_decoder =
             frames::FrameDecoder::new(&device, pipeline_cache.clone(), &video_decoder.metadata)?;
@@ -211,11 +223,9 @@ impl Video {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         frame: &Frame,
-        queued_len: usize,
+        _queued_len: usize,
         wait_duration: &mut Duration,
     ) -> Result<FrameResponse> {
-        let time = ffn::time::relative() as f64 / 1000000.0;
-
         if frame.serial
             != self
                 .state
@@ -226,7 +236,6 @@ impl Video {
                 .serial
                 .load(Ordering::SeqCst)
         {
-            self.frame_timer = time;
             return Ok(FrameResponse::Retry);
         }
 
@@ -250,44 +259,12 @@ impl Video {
             duration
         };
 
-        let mut delay = duration;
-        if let Some(video_clock) = self.video_clock.get()
-            && let Some(audio_clock) = self.audio_clock.get()
-        {
-            let diff = video_clock - audio_clock;
-            let sync_threshold = delay.clamp(Clock::SYNC_MIN, Clock::SYNC_MAX);
-            if diff < -sync_threshold {
-                delay = (delay + diff).max(0.);
-            } else if diff > sync_threshold && delay > Clock::FRAME_DUPLICATION_THRESHOLD {
-                delay += diff;
-            } else if diff > sync_threshold {
-                delay *= 2.;
-            }
-        }
-
-        if time < self.frame_timer + delay {
-            // too early
-            *wait_duration =
-                Duration::from_secs_f64(self.frame_timer + delay - time).min(*wait_duration);
-            return Ok(FrameResponse::Requeue);
-        }
-
-        self.frame_timer += delay;
-        if delay > 0.0 && time - self.frame_timer > Clock::SYNC_MAX {
-            self.frame_timer = time;
-        }
+        // Update the wait duration so the background thread knows exactly how long to sleep
+        *wait_duration = Duration::from_secs_f64(duration);
 
         let pts_sec = best_effort_timestamp as f64
             * f64::from(self.state.video_stream.load().metadata.time_base);
         self.video_clock.set(pts_sec, frame.serial, None);
-
-        if self.state.play_state() != PlayState::Step
-            && queued_len > 0
-            && time > self.frame_timer + duration
-        {
-            // drop late frame
-            return Ok(FrameResponse::Retry);
-        }
 
         unsafe {
             self.frame_decoder.decode_frame(
@@ -320,7 +297,7 @@ impl Video {
         // TODO: flush samples in AudioSink
     }
 
-    pub fn update(&mut self, encoder: &mut wgpu::CommandEncoder) -> Result<Duration> {
+    pub fn update(&mut self, encoder: &mut wgpu::CommandEncoder) -> Result<(Duration, bool)> {
         let play_state = self.state.play_state();
 
         if play_state == PlayState::Playing {
@@ -350,25 +327,67 @@ impl Video {
         }
 
         if play_state == PlayState::Paused || video_frame_queue.queued_len() == 0 {
-            return Ok(Duration::from_millis(50));
+            return Ok((Duration::from_millis(50), false));
         }
 
         let video_info = self.video_info();
+        let time_base = f64::from(video_info.time_base);
+        let audio_time = self.audio_clock.get();
 
         let mut duration = Duration::from_secs_f64(f64::from(video_info.framerate.invert()));
+        let mut frame_decoded = false;
         loop {
             let queued_len = video_frame_queue.queued_len();
+            let was_requeued = self.queued_frame.is_some();
             let frame = self
                 .queued_frame
                 .take()
                 .or_else(|| video_frame_queue.try_next());
             if let Some(frame) = frame {
+                let current_serial = self.state.video_stream.load().packets.metadata.serial.load(Ordering::SeqCst);
+                if frame.serial == current_serial {
+                    if let Some(audio_time_sec) = audio_time {
+                        let pts_sec = unsafe { (*frame.frame.as_ptr()).best_effort_timestamp } as f64 * time_base;
+                        // Clamp audio_time_sec to prevent runaway audio clock from evicting entire queue
+                        let last_video_pts_sec = self.last_pts as f64 * time_base;
+                        let audio_time_sec = audio_time_sec.min(last_video_pts_sec + 1.0);
+                        let diff = pts_sec - audio_time_sec;
+
+                        // 1. Frame is in the future: requeue it and wait.
+                        // Cap the wait to 100 ms so we never stall longer than that even
+                        // if the audio clock is lagging or hasn't started yet (e.g. during
+                        // software-decode startup, codec pipeline warm-up, etc.).
+                        if diff > 0.015 {
+                            // If this frame was already requeued once and audio still hasn't
+                            // caught up, decode it anyway. In software decoding, audio may
+                            // never catch up at real-time rates, causing an infinite stall.
+                            if was_requeued {
+                                // fall through to update_frame()
+                            } else {
+                                self.queued_frame = Some(frame);
+                                duration = Duration::from_secs_f64(diff.min(0.100));
+                                break;
+                            }
+                        }
+
+                        // 2. Frame is too late: drop/skip it to catch up
+                        // Tightened threshold to avoid dropping on micro-jitter
+                        if diff < -0.200 && queued_len > 2 {
+                            self.last_pts = unsafe { (*frame.frame.as_ptr()).best_effort_timestamp };
+                            self.last_serial = frame.serial;
+                            video_frame_queue.release(frame);
+                            continue;
+                        }
+                    }
+                }
+
                 let response = self.update_frame(encoder, &frame, queued_len, &mut duration)?;
                 match response {
                     FrameResponse::Continue => {
                         self.last_pts = unsafe { (*frame.frame.as_ptr()).best_effort_timestamp };
                         self.last_serial = frame.serial;
                         video_frame_queue.release(frame);
+                        frame_decoded = true;
                         break;
                     }
                     FrameResponse::Retry => {
@@ -386,7 +405,7 @@ impl Video {
             }
         }
 
-        Ok(duration)
+        Ok((duration, frame_decoded))
     }
 
     fn video_info(&self) -> video::VideoMetadata {
