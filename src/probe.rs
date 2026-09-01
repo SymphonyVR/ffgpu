@@ -14,7 +14,7 @@
 //! is available.
 
 use crate::error::{Error, Result};
-use ffmpeg_next::{self as ffn, sys as ff, media::Type};
+use ffmpeg_next::{self as ffn, media::Type, sys as ff};
 
 /// Map a wgpu backend to the FFmpeg hardware device type that ffgpu
 /// would try first. Mirrors `ffgpu::video::preferred_device_type_for_backend`.
@@ -71,9 +71,8 @@ pub fn probe_hardware_decoding_support<P: AsRef<std::path::Path>>(
         .ok_or_else(|| Error::Probe("no video stream found for hw probe".to_string()))?;
 
     let codec_id = video_stream.parameters().id();
-    let codec = ffn::decoder::find(codec_id).ok_or_else(|| {
-        Error::Probe(format!("codec {:?} not found for hw probe", codec_id))
-    })?;
+    let codec = ffn::decoder::find(codec_id)
+        .ok_or_else(|| Error::Probe(format!("codec {:?} not found for hw probe", codec_id)))?;
 
     // FFmpeg can advertise a Vulkan VP9 hw config even when the active Vulkan
     // device has no VP9 decode extension. Let the GPU-backed software adapter

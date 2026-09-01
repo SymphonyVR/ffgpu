@@ -31,13 +31,13 @@
 
 use super::FrameAdapter;
 use super::GlInteropTicket;
-use std::ffi::c_void;
 use crate::{
     context::{layout, pipeline_cache::PipelineCache},
     decode::frames::FrameAdapterBuilder,
     error::{Error, Result},
 };
 use ffmpeg_next::sys as ff;
+use std::ffi::c_void;
 use std::{ptr::NonNull, sync::OnceLock};
 
 // `gl` 0.14 only generates core GL entry points, not the EXT_memory_object /
@@ -56,6 +56,7 @@ const GL_NEAREST: gl::types::GLenum = 0x2600;
 const GL_TRUE: gl::types::GLboolean = 1;
 // GL_EXT_memory_object_win32 handle types
 const GL_HANDLE_TYPE_D3D11_IMAGE_EXT: gl::types::GLenum = 0x958B;
+#[allow(dead_code)] // sibling handle type kept for the opaque-win32 import variant
 const GL_HANDLE_TYPE_OPAQUE_WIN32_EXT: gl::types::GLenum = 0x9587;
 // GL_EXT_memory_object pname values
 const GL_DEDICATED_MEMORY_OBJECT_EXT: gl::types::GLenum = 0x9581;
@@ -66,13 +67,12 @@ const GL_DEVICE_NODE_MASK_EXT: gl::types::GLenum = 0x959A;
 #[cfg(target_os = "windows")]
 mod win32_gl_ext {
     use std::ffi::c_void;
-    use windows::{
-        Win32::Graphics::OpenGL::wglGetProcAddress,
-        core::PCSTR,
-    };
+    use windows::{Win32::Graphics::OpenGL::wglGetProcAddress, core::PCSTR};
 
-    type PfnCreateMemoryObjectsEXT = unsafe extern "C" fn(gl::types::GLsizei, *mut gl::types::GLuint);
-    type PfnDeleteMemoryObjectsEXT = unsafe extern "C" fn(gl::types::GLsizei, *const gl::types::GLuint);
+    type PfnCreateMemoryObjectsEXT =
+        unsafe extern "C" fn(gl::types::GLsizei, *mut gl::types::GLuint);
+    type PfnDeleteMemoryObjectsEXT =
+        unsafe extern "C" fn(gl::types::GLsizei, *const gl::types::GLuint);
     type PfnTexStorageMem2DEXT = unsafe extern "C" fn(
         gl::types::GLuint,
         gl::types::GLsizei,
@@ -82,16 +82,22 @@ mod win32_gl_ext {
         gl::types::GLuint,
         gl::types::GLuint64,
     );
-    type PfnImportMemoryWin32HandleEXT =
-        unsafe extern "C" fn(gl::types::GLuint, gl::types::GLuint64, gl::types::GLenum, *mut c_void);
-    type PfnAcquireKeyedMutexWin32EXT =
-        unsafe extern "C" fn(gl::types::GLuint, gl::types::GLuint64, gl::types::GLuint64) -> gl::types::GLboolean;
+    type PfnImportMemoryWin32HandleEXT = unsafe extern "C" fn(
+        gl::types::GLuint,
+        gl::types::GLuint64,
+        gl::types::GLenum,
+        *mut c_void,
+    );
+    type PfnAcquireKeyedMutexWin32EXT = unsafe extern "C" fn(
+        gl::types::GLuint,
+        gl::types::GLuint64,
+        gl::types::GLuint64,
+    ) -> gl::types::GLboolean;
     type PfnReleaseKeyedMutexWin32EXT =
         unsafe extern "C" fn(gl::types::GLuint, gl::types::GLuint64) -> gl::types::GLboolean;
     type PfnMemoryObjectParameterivEXT =
         unsafe extern "C" fn(gl::types::GLuint, gl::types::GLenum, *const gl::types::GLint);
-    type PfnGetUnsignedBytevEXT =
-        unsafe extern "C" fn(gl::types::GLenum, *mut gl::types::GLubyte);
+    type PfnGetUnsignedBytevEXT = unsafe extern "C" fn(gl::types::GLenum, *mut gl::types::GLubyte);
 
     fn load_fn<T>(name: &[u8]) -> Option<T> {
         let cstr = std::ffi::CStr::from_bytes_with_nul(name).ok()?;
@@ -220,8 +226,14 @@ mod wgl_nv_dx_interop {
         for &(name, label) in &[
             (b"wglDXOpenDeviceNV\0".as_slice(), "wglDXOpenDeviceNV"),
             (b"wglDXCloseDeviceNV\0".as_slice(), "wglDXCloseDeviceNV"),
-            (b"wglDXRegisterObjectNV\0".as_slice(), "wglDXRegisterObjectNV"),
-            (b"wglDXUnregisterObjectNV\0".as_slice(), "wglDXUnregisterObjectNV"),
+            (
+                b"wglDXRegisterObjectNV\0".as_slice(),
+                "wglDXRegisterObjectNV",
+            ),
+            (
+                b"wglDXUnregisterObjectNV\0".as_slice(),
+                "wglDXUnregisterObjectNV",
+            ),
             (b"wglDXLockObjectsNV\0".as_slice(), "wglDXLockObjectsNV"),
             (b"wglDXUnlockObjectsNV\0".as_slice(), "wglDXUnlockObjectsNV"),
         ] {
@@ -249,6 +261,7 @@ const WGL_ACCESS_READ_WRITE_NV: gl::types::GLenum = 0x0001;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenGlInteropPath {
     /// Linux: VA-API → DRM PRIME → EGLImage. True zero-copy.
+    #[allow(dead_code)] // Linux-only zero-copy path; inactive on Windows builds
     DirectPlaneImport,
     /// Windows: D3D11VA → D3D11 plane-copy shader → GL external memory import.
     /// One GPU copy, no CPU readback.
@@ -282,6 +295,7 @@ unsafe fn gl_context_probe(device: &wgpu::Device) {
 
 /// Holds the two wgpu textures (Y, UV), their bind group, and the raw GL /
 /// platform handles needed to re-point them at each new frame's memory object.
+#[allow(dead_code)] // draft GL-import frame holder; wired up with the memory-object path
 struct GlImportedFrame {
     y_texture: wgpu::Texture,
     uv_texture: wgpu::Texture,
@@ -300,6 +314,7 @@ struct GlImportedFrame {
     bg0: wgpu::BindGroup,
 }
 
+#[allow(dead_code)] // draft GL-import frame holder; wired up with the memory-object path
 impl GlImportedFrame {
     /// Create the wgpu texture wrappers + bind group once. The GL objects are
     /// created lazily on first `import` because their dimensions are only known
@@ -313,64 +328,71 @@ impl GlImportedFrame {
         color_space: ffmpeg_next::color::Space,
     ) -> Self {
         let (y_fmt, uv_fmt) = match depth {
-                layout::Depth::D16 => (wgpu::TextureFormat::R16Unorm, wgpu::TextureFormat::Rg16Unorm),
-                _ => (wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm),
-            };
+            layout::Depth::D16 => (
+                wgpu::TextureFormat::R16Unorm,
+                wgpu::TextureFormat::Rg16Unorm,
+            ),
+            _ => (wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm),
+        };
 
-            let y_texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: None,
-                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: y_fmt,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            let uv_texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: None,
-                size: wgpu::Extent3d {
-                    width: width / 2,
-                    height: height / 2,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: uv_fmt,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
+        let y_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: y_fmt,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let uv_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: width / 2,
+                height: height / 2,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: uv_fmt,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
 
-            let layout = layout::FrameDescriptor {
-                planes: layout::PlaneLayout::PackedYUV420([y_fmt, uv_fmt]),
+        let layout = layout::FrameDescriptor {
+            planes: layout::PlaneLayout::PackedYUV420([y_fmt, uv_fmt]),
+            depth,
+        };
+        let bg0 = pipeline_cache.bind_frame_textures(
+            &layout::FrameDescriptor {
+                planes: layout::PlaneLayout::PackedYUV420([
+                    y_texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                    uv_texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                ]),
                 depth,
-            };
-            let bg0 = pipeline_cache.bind_frame_textures(
-                &layout::FrameDescriptor {
-                    planes: layout::PlaneLayout::PackedYUV420([
-                        y_texture.create_view(&wgpu::TextureViewDescriptor::default()),
-                        uv_texture.create_view(&wgpu::TextureViewDescriptor::default()),
-                    ]),
-                    depth,
-                },
-                color_space,
-            );
+            },
+            color_space,
+        );
 
-            GlImportedFrame {
-                y_texture,
-                uv_texture,
-                y_gl: 0,
-                uv_gl: 0,
-                y_wgpu: None,
-                uv_wgpu: None,
-                #[cfg(target_os = "windows")]
-                y_mem: 0,
-                #[cfg(target_os = "windows")]
-                uv_mem: 0,
-                identity: layout.as_identity(),
-                bg0,
-            }
+        GlImportedFrame {
+            y_texture,
+            uv_texture,
+            y_gl: 0,
+            uv_gl: 0,
+            y_wgpu: None,
+            uv_wgpu: None,
+            #[cfg(target_os = "windows")]
+            y_mem: 0,
+            #[cfg(target_os = "windows")]
+            uv_mem: 0,
+            identity: layout.as_identity(),
+            bg0,
+        }
     }
 
     /// Wrap an already-created GL texture (whose storage is backed by external
@@ -381,17 +403,25 @@ impl GlImportedFrame {
     /// NOTE: the first call creates the wgpu texture; subsequent calls recreate
     /// it from the same GLuint (the GL object identity is stable, so the bind
     /// group created against the original view remains valid).
-    unsafe fn wrap(
-        &mut self,
-        device: &wgpu::Device,
-        is_y: bool,
-    ) -> Result<()> {
+    unsafe fn wrap(&mut self, device: &wgpu::Device, is_y: bool) -> Result<()> {
         unsafe {
-            let hal = device.as_hal::<wgpu::hal::gles::Api>().ok_or(Error::UnsupportedBackend)?;
+            let hal = device
+                .as_hal::<wgpu::hal::gles::Api>()
+                .ok_or(Error::UnsupportedBackend)?;
             let (_tex, fmt, w, h) = if is_y {
-                (&self.y_texture, self.y_texture.format(), self.y_texture.width(), self.y_texture.height())
+                (
+                    &self.y_texture,
+                    self.y_texture.format(),
+                    self.y_texture.width(),
+                    self.y_texture.height(),
+                )
             } else {
-                (&self.uv_texture, self.uv_texture.format(), self.uv_texture.width(), self.uv_texture.height())
+                (
+                    &self.uv_texture,
+                    self.uv_texture.format(),
+                    self.uv_texture.width(),
+                    self.uv_texture.height(),
+                )
             };
             let gl_name = if is_y { self.y_gl } else { self.uv_gl };
 
@@ -399,7 +429,11 @@ impl GlImportedFrame {
             // `import_win32_plane` when it was 0). Re-create + cache the wgpu
             // wrapper only when we don't already hold one, instead of
             // allocating and immediately discarding a texture every frame.
-            let cache = if is_y { &mut self.y_wgpu } else { &mut self.uv_wgpu };
+            let cache = if is_y {
+                &mut self.y_wgpu
+            } else {
+                &mut self.uv_wgpu
+            };
             if cache.is_some() {
                 return Ok(());
             }
@@ -408,7 +442,11 @@ impl GlImportedFrame {
                 std::num::NonZeroU32::new(gl_name).ok_or(Error::Unknown)?,
                 &wgpu::hal::TextureDescriptor {
                     label: None,
-                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
@@ -423,7 +461,11 @@ impl GlImportedFrame {
                 hal_tex,
                 &wgpu::TextureDescriptor {
                     label: None,
-                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
@@ -500,8 +542,7 @@ mod linux {
         fn eglDestroyImage(display: *mut c_void, image: *mut c_void) -> gl::types::GLboolean;
     }
 
-    type PfnEGLImageTargetTexture2DOES =
-        unsafe extern "C" fn(gl::types::GLenum, *mut c_void);
+    type PfnEGLImageTargetTexture2DOES = unsafe extern "C" fn(gl::types::GLenum, *mut c_void);
 
     unsafe fn load_egl_image_target() -> Option<PfnEGLImageTargetTexture2DOES> {
         // EGL and GL share the same proc-address space on EGL platforms.
@@ -627,14 +668,13 @@ mod linux {
                     return Err(Error::TextureShare);
                 }
 
-                let drm_desc = ((*drm_frame.as_ptr()).data[0]
-                    as *const ff::AVDRMFrameDescriptor)
+                let drm_desc = ((*drm_frame.as_ptr()).data[0] as *const ff::AVDRMFrameDescriptor)
                     .as_ref()
                     .ok_or(Error::TextureShare)?;
 
                 if drm_desc.nb_layers != 2
-                    || drm_desc.layers[0].format != (538982482 /* DRM_FORMAT_R8 */)
-                    || drm_desc.layers[1].format != (943215175 /* DRM_FORMAT_GR88 */)
+                    || drm_desc.layers[0].format != (538982482/* DRM_FORMAT_R8 */)
+                    || drm_desc.layers[1].format != (943215175/* DRM_FORMAT_GR88 */)
                 {
                     ff::av_frame_unref(drm_frame.as_ptr());
                     ff::av_frame_free(&mut drm_frame.as_ptr());
@@ -681,7 +721,11 @@ mod linux {
                 imported.wrap(device, false)?;
 
                 let _ = display;
-                Ok(VaapiEglImport { y, uv, imported: Some(imported) })
+                Ok(VaapiEglImport {
+                    y,
+                    uv,
+                    imported: Some(imported),
+                })
             }
         }
 
@@ -710,9 +754,9 @@ mod linux {
 
 #[cfg(target_os = "windows")]
 mod win {
+    use super::super::GlInteropTicket;
     use super::*;
     use std::ffi::c_void;
-    use super::super::GlInteropTicket;
     use windows::{
         Win32::{
             Foundation,
@@ -850,15 +894,26 @@ mod win {
     /// `Probe` error — the caller should fall back to software decoding rather
     /// than crash, since a missing/old d3dcompiler is a non-fatal environment
     /// issue.
-    unsafe fn compile_hlsl(
-        source: &str,
-        entry: &str,
-        target: &str,
-    ) -> Result<Vec<u8>> {
+    unsafe fn compile_hlsl(source: &str, entry: &str, target: &str) -> Result<Vec<u8>> {
         unsafe {
-            let src_bytes: Vec<u8> = source.as_bytes().iter().copied().chain(std::iter::once(0)).collect();
-            let entry_bytes: Vec<u8> = entry.as_bytes().iter().copied().chain(std::iter::once(0)).collect();
-            let target_bytes: Vec<u8> = target.as_bytes().iter().copied().chain(std::iter::once(0)).collect();
+            let src_bytes: Vec<u8> = source
+                .as_bytes()
+                .iter()
+                .copied()
+                .chain(std::iter::once(0))
+                .collect();
+            let entry_bytes: Vec<u8> = entry
+                .as_bytes()
+                .iter()
+                .copied()
+                .chain(std::iter::once(0))
+                .collect();
+            let target_bytes: Vec<u8> = target
+                .as_bytes()
+                .iter()
+                .copied()
+                .chain(std::iter::once(0))
+                .collect();
             let mut code: Option<Direct3D::ID3DBlob> = None;
             let mut err: Option<Direct3D::ID3DBlob> = None;
             // d3dcompiler_47 ships with Windows 10+; load it via the OS.
@@ -879,11 +934,14 @@ mod win {
                 let p = err_blob.GetBufferPointer();
                 let len = err_blob.GetBufferSize();
                 let msg = if len > 0 {
-                    String::from_utf8_lossy(std::slice::from_raw_parts(p as *const u8, len)).to_string()
+                    String::from_utf8_lossy(std::slice::from_raw_parts(p as *const u8, len))
+                        .to_string()
                 } else {
                     String::new()
                 };
-                return Err(Error::Probe(format!("HLSL compile ({entry}) failed: {msg}")));
+                return Err(Error::Probe(format!(
+                    "HLSL compile ({entry}) failed: {msg}"
+                )));
             }
             hr.map_err(|e| Error::Probe(format!("D3DCompile load/invoke failed: {e}")))?;
             let code = code.ok_or(Error::Probe("D3DCompile returned no bytecode".into()))?;
@@ -894,9 +952,7 @@ mod win {
         }
     }
 
-    unsafe fn build_plane_copy_pipeline(
-        device: &D3D11::ID3D11Device,
-    ) -> Result<PlaneCopyPipeline> {
+    unsafe fn build_plane_copy_pipeline(device: &D3D11::ID3D11Device) -> Result<PlaneCopyPipeline> {
         unsafe {
             let vs = compile_hlsl(PLANE_COPY_VS, "main", "vs_5_0")?;
             let ps_y = compile_hlsl(PLANE_COPY_PS_Y, "main", "ps_5_0")?;
@@ -958,6 +1014,7 @@ mod win {
         fn drop(&mut self) {}
     }
 
+    #[allow(dead_code)] // format introspection helper for future shared-handle validation
     unsafe fn decoder_texture_format(
         tex: &D3D11::ID3D11Texture2D,
     ) -> Result<Dxgi::Common::DXGI_FORMAT> {
@@ -978,7 +1035,9 @@ mod win {
                 .CreateTexture2D(desc, None, Some(&mut tex))
                 .map_err(|_| Error::TextureShare)?;
             let tex = tex.ok_or(Error::TextureShare)?;
-            let dxgi = tex.cast::<Dxgi::IDXGIResource1>().map_err(|_| Error::TextureShare)?;
+            let dxgi = tex
+                .cast::<Dxgi::IDXGIResource1>()
+                .map_err(|_| Error::TextureShare)?;
             let handle = dxgi
                 .CreateSharedHandle(None, Dxgi::DXGI_SHARED_RESOURCE_READ.0, None)
                 .map_err(|_| Error::TextureShare)?;
@@ -1009,8 +1068,14 @@ mod win {
     ) -> Result<PlaneCopyTextures> {
         unsafe {
             let (y_fmt, uv_fmt) = match depth {
-                layout::Depth::D16 => (Dxgi::Common::DXGI_FORMAT_R16_UNORM, Dxgi::Common::DXGI_FORMAT_R16G16_UNORM),
-                _ => (Dxgi::Common::DXGI_FORMAT_R8_UNORM, Dxgi::Common::DXGI_FORMAT_R8G8_UNORM),
+                layout::Depth::D16 => (
+                    Dxgi::Common::DXGI_FORMAT_R16_UNORM,
+                    Dxgi::Common::DXGI_FORMAT_R16G16_UNORM,
+                ),
+                _ => (
+                    Dxgi::Common::DXGI_FORMAT_R8_UNORM,
+                    Dxgi::Common::DXGI_FORMAT_R8G8_UNORM,
+                ),
             };
 
             let shared_desc = D3D11::D3D11_TEXTURE2D_DESC {
@@ -1019,7 +1084,10 @@ mod win {
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: y_fmt,
-                SampleDesc: Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11::D3D11_USAGE_DEFAULT,
                 BindFlags: D3D11::D3D11_BIND_RENDER_TARGET.0 as u32
                     | D3D11::D3D11_BIND_SHADER_RESOURCE.0 as u32,
@@ -1147,9 +1215,13 @@ mod win {
         /// Persistent GL texture names (target = GL_TEXTURE_2D); backed by
         /// the imported memory objects. The wgpu `Texture` is created once
         /// from this name and never re-wrapped.
+        #[allow(dead_code)] // GL names kept for debugging/interop; draws go through the views
         y_gl: gl::types::GLuint,
+        #[allow(dead_code)]
         uv_gl: gl::types::GLuint,
+        #[allow(dead_code)] // cached wrappers kept alive alongside their views
         y_wgpu: Option<wgpu::Texture>,
+        #[allow(dead_code)]
         uv_wgpu: Option<wgpu::Texture>,
         y_view: Option<wgpu::TextureView>,
         uv_view: Option<wgpu::TextureView>,
@@ -1163,14 +1235,17 @@ mod win {
     /// the COM `IDXGIKeyedMutex` interface (Acquire/Release); the GL side
     /// uses `glAcquireKeyedMutexWin32EXT` / `glReleaseKeyedMutexWin32EXT` to
     /// insert the corresponding waits into the GL command stream.
-    struct MemoryObjectRing {
+    // pub(super) to match InteropMode, whose variant exposes this type.
+    pub(super) struct MemoryObjectRing {
         core: PlaneCopyCore,
         ext: &'static win32_gl_ext::Win32GlExt,
+        #[allow(dead_code)] // held to keep the wgpu device alive as long as the ring
         device: wgpu::Device,
         slots: Vec<MemoryObjectSlot>,
         generation: u32,
         /// Slot whose views were last locked and should be sampled by the draw.
         current_slot: Option<u8>,
+        #[allow(dead_code)] // cached format identity; consumed by future resize handling
         depth: layout::Depth,
         width: u32,
         height: u32,
@@ -1193,6 +1268,7 @@ mod win {
     /// Both the WGL and the memory-object interop strategies use the same
     /// core: only the per-slot ownership of the R8/RG8 output differs.
     struct PlaneCopyCore {
+        #[allow(dead_code)] // held to keep the D3D11 device alive as long as the core
         device: D3D11::ID3D11Device,
         context: D3D11::ID3D11DeviceContext,
         pipeline: PlaneCopyPipeline,
@@ -1210,14 +1286,21 @@ mod win {
             array_slice: u32,
         ) -> Result<Self> {
             unsafe {
-                let context = d3d11_device.GetImmediateContext().map_err(|_| Error::Unknown)?;
+                let context = d3d11_device
+                    .GetImmediateContext()
+                    .map_err(|_| Error::Unknown)?;
                 let mut tex_desc = D3D11::D3D11_TEXTURE2D_DESC::default();
                 decoder_texture.GetDesc(&mut tex_desc);
                 eprintln!(
                     "[opengl] PlaneCopyCore decoder texture: {}x{} fmt={:?} array_size={} mip_levels={} bind=0x{:08X} misc=0x{:08X} (array_slice={})",
-                    tex_desc.Width, tex_desc.Height, tex_desc.Format,
-                    tex_desc.ArraySize, tex_desc.MipLevels,
-                    tex_desc.BindFlags, tex_desc.MiscFlags, array_slice,
+                    tex_desc.Width,
+                    tex_desc.Height,
+                    tex_desc.Format,
+                    tex_desc.ArraySize,
+                    tex_desc.MipLevels,
+                    tex_desc.BindFlags,
+                    tex_desc.MiscFlags,
+                    array_slice,
                 );
                 if tex_desc.Format != Dxgi::Common::DXGI_FORMAT_NV12 {
                     eprintln!(
@@ -1284,7 +1367,11 @@ mod win {
                 };
                 let mut srv_uv = None;
                 d3d11_device
-                    .CreateShaderResourceView(decoder_texture, Some(&srv_desc_uv), Some(&mut srv_uv))
+                    .CreateShaderResourceView(
+                        decoder_texture,
+                        Some(&srv_desc_uv),
+                        Some(&mut srv_uv),
+                    )
                     .map_err(|e| {
                         eprintln!("[opengl] CreateShaderResourceView(UV) FAILED: {:?}", e);
                         Error::TextureShare
@@ -1293,9 +1380,15 @@ mod win {
                     eprintln!("[opengl] CreateShaderResourceView(UV) returned null SRV");
                     Error::TextureShare
                 })?;
-                eprintln!("[opengl] Y/UV SRVs created OK (array_slice={})", array_slice);
+                eprintln!(
+                    "[opengl] Y/UV SRVs created OK (array_slice={})",
+                    array_slice
+                );
                 let pipeline = match build_plane_copy_pipeline(d3d11_device) {
-                    Ok(p) => { eprintln!("[opengl] build_plane_copy_pipeline OK"); p }
+                    Ok(p) => {
+                        eprintln!("[opengl] build_plane_copy_pipeline OK");
+                        p
+                    }
                     Err(e) => {
                         eprintln!("[opengl] build_plane_copy_pipeline FAILED: {:?}", e);
                         return Err(e);
@@ -1350,6 +1443,7 @@ mod win {
         height: u32,
         color_space: ffmpeg_next::color::Space,
         d3d11_device: D3D11::ID3D11Device,
+        #[allow(dead_code)] // held to keep the wgpu device alive for the import path
         device: wgpu::Device,
         decoder_texture: D3D11::ID3D11Texture2D,
         array_slice: u32,
@@ -1410,7 +1504,9 @@ mod win {
                 dev_flags,
                 if dev_flags & (D3D11::D3D11_CREATE_DEVICE_SINGLETHREADED.0 as u32) != 0 {
                     " [SINGLETHREADED]"
-                } else { "" }
+                } else {
+                    ""
+                }
             );
             // D3D11.1+ is required for video-resource ShaderResourceViews over
             // NV12 multi-plane views, and is also the runtime that exposes
@@ -1481,7 +1577,10 @@ mod win {
                 ) {
                     Ok(ring) => {
                         self.mode = Some(InteropMode::MemoryObject(ring));
-                        eprintln!("[opengl] GL interop: memory-object ring active ({} slots)", INTEROP_RING_SIZE);
+                        eprintln!(
+                            "[opengl] GL interop: memory-object ring active ({} slots)",
+                            INTEROP_RING_SIZE
+                        );
                         return Ok(());
                     }
                     Err(e) => {
@@ -1549,6 +1648,7 @@ mod win {
             Ok(())
         }
 
+        #[allow(dead_code)] // GL-interop cancel path reserved for the render-error handler
         pub(super) fn cancel_gl_frame(&mut self, ticket: GlInteropTicket) -> Result<()> {
             match self.mode.as_mut() {
                 Some(InteropMode::MemoryObject(ring)) => unsafe { ring.cancel_gl_frame(ticket)? },
@@ -1739,11 +1839,17 @@ mod win {
                 // (7) Build the layout identity used by the engine to select
                 // the correct YUV→RGB conversion matrix.
                 let (y_fmt, _uv_fmt) = match depth {
-                    layout::Depth::D16 => (wgpu::TextureFormat::R16Unorm, wgpu::TextureFormat::Rg16Unorm),
+                    layout::Depth::D16 => (
+                        wgpu::TextureFormat::R16Unorm,
+                        wgpu::TextureFormat::Rg16Unorm,
+                    ),
                     _ => (wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm),
                 };
                 let layout_identity = layout::FrameDescriptor {
-                    planes: layout::PlaneLayout::PackedYUV420([y_fmt, wgpu::TextureFormat::Rg8Unorm]),
+                    planes: layout::PlaneLayout::PackedYUV420([
+                        y_fmt,
+                        wgpu::TextureFormat::Rg8Unorm,
+                    ]),
                     depth,
                 }
                 .as_identity();
@@ -1785,10 +1891,16 @@ mod win {
 
                 // (a) Pick a free slot. Starvation drops the frame: the engine
                 // keeps sampling the last locked slot instead of blocking.
-                let slot_idx = match self.slots.iter().position(|s| s.state == MemoryObjectSlotState::Free) {
+                let slot_idx = match self
+                    .slots
+                    .iter()
+                    .position(|s| s.state == MemoryObjectSlotState::Free)
+                {
                     Some(i) => i,
                     None => {
-                        eprintln!("[opengl] memory-object: ring starvation — dropping decoded frame");
+                        eprintln!(
+                            "[opengl] memory-object: ring starvation — dropping decoded frame"
+                        );
                         return Ok(None);
                     }
                 };
@@ -1805,8 +1917,11 @@ mod win {
                     .uv_d3d11
                     .cast::<Dxgi::IDXGIKeyedMutex>()
                     .map_err(|_| Error::TextureShare)?;
-                y_km.AcquireSync(0, u32::MAX).map_err(|_| Error::TextureShare)?;
-                uv_km.AcquireSync(0, u32::MAX).map_err(|_| Error::TextureShare)?;
+                y_km.AcquireSync(0, u32::MAX)
+                    .map_err(|_| Error::TextureShare)?;
+                uv_km
+                    .AcquireSync(0, u32::MAX)
+                    .map_err(|_| Error::TextureShare)?;
 
                 {
                     let ctx = &self.core.context;
@@ -1886,7 +2001,10 @@ mod win {
         /// The keyed mutex is released only after the fence signals; releasing
         /// immediately after `queue.submit` races the GL sampler and is
         /// rejected by `GL_EXT_win32_keyed_mutex`.
-        pub(super) unsafe fn finish_gl_frames(&mut self, tickets: &[GlInteropTicket]) -> Result<()> {
+        pub(super) unsafe fn finish_gl_frames(
+            &mut self,
+            tickets: &[GlInteropTicket],
+        ) -> Result<()> {
             if tickets.is_empty() {
                 return Ok(());
             }
@@ -1935,11 +2053,7 @@ mod win {
                     if slot.state != MemoryObjectSlotState::Submitted {
                         continue;
                     }
-                    let status = gl::ClientWaitSync(
-                        fence,
-                        gl::SYNC_FLUSH_COMMANDS_BIT,
-                        0,
-                    );
+                    let status = gl::ClientWaitSync(fence, gl::SYNC_FLUSH_COMMANDS_BIT, 0);
                     if status != gl::ALREADY_SIGNALED && status != gl::CONDITION_SATISFIED {
                         continue;
                     }
@@ -1961,6 +2075,7 @@ mod win {
 
         /// Cancel a locked slot whose draw was never recorded. Enqueue the
         /// release back to key 0 so the producer can move on.
+        #[allow(dead_code)] // GL-interop cancel path reserved for the render-error handler
         pub(super) unsafe fn cancel_gl_frame(&mut self, ticket: GlInteropTicket) -> Result<()> {
             unsafe {
                 if ticket.generation != self.generation {
@@ -2019,9 +2134,7 @@ mod win {
 
     /// Read the D3D11 device's adapter LUID via `IDXGIDevice::GetAdapter`.
     /// Returns the complete eight-byte Windows LUID in native byte order.
-    unsafe fn read_d3d11_adapter_luid(
-        d3d11_device: &D3D11::ID3D11Device,
-    ) -> Option<[u8; 8]> {
+    unsafe fn read_d3d11_adapter_luid(d3d11_device: &D3D11::ID3D11Device) -> Option<[u8; 8]> {
         unsafe {
             let dxgi_device = d3d11_device.cast::<Dxgi::IDXGIDevice>().ok()?;
             let adapter = dxgi_device.GetAdapter().ok()?;
@@ -2037,9 +2150,7 @@ mod win {
     /// extension. LUID is an eight-byte unsigned-byte query; using
     /// `GetIntegerv` here returns unrelated state and can manufacture a false
     /// adapter mismatch.
-    unsafe fn read_gl_device_luid(
-        ext: &win32_gl_ext::Win32GlExt,
-    ) -> Option<[u8; 8]> {
+    unsafe fn read_gl_device_luid(ext: &win32_gl_ext::Win32GlExt) -> Option<[u8; 8]> {
         unsafe {
             let mut luid = [0u8; 8];
             (ext.get_unsigned_bytev)(GL_DEVICE_LUID_EXT, luid.as_mut_ptr());
@@ -2073,10 +2184,7 @@ mod win {
     unsafe fn check_gl_error(stage: &str) -> Result<()> {
         let error = gl::GetError();
         if error != gl::NO_ERROR {
-            eprintln!(
-                "[opengl] GL error 0x{:04X} during {}",
-                error, stage
-            );
+            eprintln!("[opengl] GL error 0x{:04X} during {}", error, stage);
             Err(Error::TextureShare)
         } else {
             Ok(())
@@ -2162,9 +2270,17 @@ mod win {
                     return Err(Error::TextureShare);
                 }
                 let true_val = [GL_TRUE as gl::types::GLint];
-                (ext.memory_object_parameteriv)(mems[0], GL_DEDICATED_MEMORY_OBJECT_EXT, true_val.as_ptr());
+                (ext.memory_object_parameteriv)(
+                    mems[0],
+                    GL_DEDICATED_MEMORY_OBJECT_EXT,
+                    true_val.as_ptr(),
+                );
                 check_gl_error("MemoryObjectParameterivEXT(Y)")?;
-                (ext.memory_object_parameteriv)(mems[1], GL_DEDICATED_MEMORY_OBJECT_EXT, true_val.as_ptr());
+                (ext.memory_object_parameteriv)(
+                    mems[1],
+                    GL_DEDICATED_MEMORY_OBJECT_EXT,
+                    true_val.as_ptr(),
+                );
                 check_gl_error("MemoryObjectParameterivEXT(UV)")?;
 
                 // (2) Import each NT handle into its memory object. Size 0
@@ -2237,15 +2353,8 @@ mod win {
             // context itself as needed. Externally imported textures are
             // registered (not actually compiled), so this is the path that
             // does NOT panic on re-entry.
-            let y_wgpu = wrap_external_gl_texture(
-                device,
-                y_gl,
-                y_w,
-                y_h,
-                wgpu_y_format(depth),
-                ext,
-                y_mem,
-            )?;
+            let y_wgpu =
+                wrap_external_gl_texture(device, y_gl, y_w, y_h, wgpu_y_format(depth), ext, y_mem)?;
             let y_view = y_wgpu.create_view(&wgpu::TextureViewDescriptor::default());
             let uv_wgpu = wrap_external_gl_texture(
                 device,
@@ -2312,7 +2421,11 @@ mod win {
                 std::num::NonZeroU32::new(gl_name).ok_or(Error::Unknown)?,
                 &wgpu::hal::TextureDescriptor {
                     label: None,
-                    size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
@@ -2327,7 +2440,11 @@ mod win {
                 hal_tex,
                 &wgpu::TextureDescriptor {
                     label: None,
-                    size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
@@ -2361,7 +2478,9 @@ mod win {
         ) -> Result<Self> {
             unsafe {
                 // (1) Lock the GL context so WGL functions are callable.
-                let hal = device.as_hal::<wgpu::hal::gles::Api>().ok_or(Error::UnsupportedBackend)?;
+                let hal = device
+                    .as_hal::<wgpu::hal::gles::Api>()
+                    .ok_or(Error::UnsupportedBackend)?;
                 let _gl_guard = hal.context().lock();
 
                 // (2) Diagnostic: adapter LUID, GL_RENDERER, WGL extension presence.
@@ -2379,14 +2498,19 @@ mod win {
                 // (WGL requires a multithreaded device).
                 let flags = d3d11_device.GetCreationFlags();
                 if flags & (D3D11::D3D11_CREATE_DEVICE_SINGLETHREADED.0 as u32) != 0 {
-                    eprintln!("[opengl] WGL interop rejected: D3D11 device is SINGLETHREADED (flags=0x{:08X})", flags);
+                    eprintln!(
+                        "[opengl] WGL interop rejected: D3D11 device is SINGLETHREADED (flags=0x{:08X})",
+                        flags
+                    );
                     return Err(Error::TextureShare);
                 }
 
                 // (5) Open the D3D11 device for WGL interop.
                 let dx_device = (wgl.dx_open_device)(d3d11_device.as_raw() as *mut c_void);
                 if dx_device.is_null() {
-                    eprintln!("[opengl] wglDXOpenDeviceNV FAILED — device incompatibility or cross-GPU mismatch");
+                    eprintln!(
+                        "[opengl] wglDXOpenDeviceNV FAILED — device incompatibility or cross-GPU mismatch"
+                    );
                     return Err(Error::TextureShare);
                 }
                 eprintln!("[opengl] wglDXOpenDeviceNV OK (handle={:p})", dx_device);
@@ -2399,12 +2523,22 @@ mod win {
                 let core = PlaneCopyCore::new(d3d11_device, decoder_texture, array_slice)?;
 
                 // (6) Build N persistent slots.
-                eprintln!("[opengl] building {} ring slots ({}x{})", INTEROP_RING_SIZE, width, height);
+                eprintln!(
+                    "[opengl] building {} ring slots ({}x{})",
+                    INTEROP_RING_SIZE, width, height
+                );
                 let mut slots = Vec::with_capacity(INTEROP_RING_SIZE);
                 for slot_id in 0..(INTEROP_RING_SIZE as u8) {
                     eprintln!("[opengl]   creating ring slot {}...", slot_id);
                     let slot = create_ring_slot(
-                        &wgl, dx_device, device, d3d11_device, width, height, depth, slot_id,
+                        &wgl,
+                        dx_device,
+                        device,
+                        d3d11_device,
+                        width,
+                        height,
+                        depth,
+                        slot_id,
                     )?;
                     eprintln!("[opengl]   ring slot {} OK", slot_id);
                     slots.push(slot);
@@ -2441,15 +2575,11 @@ mod win {
                 let _gl_guard = hal.context().lock();
                 for slot in self.slots.iter_mut() {
                     if let (WglSlotState::Submitted, Some(fence)) = (slot.state, slot.fence) {
-                        let status = gl::ClientWaitSync(
-                            fence,
-                            gl::SYNC_FLUSH_COMMANDS_BIT,
-                            0,
-                        );
+                        let status = gl::ClientWaitSync(fence, gl::SYNC_FLUSH_COMMANDS_BIT, 0);
                         if status == gl::ALREADY_SIGNALED || status == gl::CONDITION_SATISFIED {
-                             gl::DeleteSync(fence);
-                             slot.fence = None;
-                             Self::unlock_slot(&self.wgl, self.dx_device, slot);
+                            gl::DeleteSync(fence);
+                            slot.fence = None;
+                            Self::unlock_slot(&self.wgl, self.dx_device, slot);
                         }
                     }
                 }
@@ -2487,7 +2617,11 @@ mod win {
                 // Pick a Free slot. On starvation, drop this frame (the engine
                 // keeps sampling the last locked slot) rather than overwrite an
                 // in-use one or block the renderer.
-                let slot_idx = match self.slots.iter().position(|s| s.state == WglSlotState::Free) {
+                let slot_idx = match self
+                    .slots
+                    .iter()
+                    .position(|s| s.state == WglSlotState::Free)
+                {
                     Some(i) => i,
                     None => {
                         eprintln!("[opengl] interop ring starvation: dropping decoded frame");
@@ -2497,15 +2631,26 @@ mod win {
                 eprintln!("[opengl] import_frame: picked slot {}", slot_idx);
 
                 let (y_fmt, uv_fmt) = match self.depth {
-                    layout::Depth::D16 => (Dxgi::Common::DXGI_FORMAT_R16_UNORM, Dxgi::Common::DXGI_FORMAT_R16G16_UNORM),
-                    _ => (Dxgi::Common::DXGI_FORMAT_R8_UNORM, Dxgi::Common::DXGI_FORMAT_R8G8_UNORM),
+                    layout::Depth::D16 => (
+                        Dxgi::Common::DXGI_FORMAT_R16_UNORM,
+                        Dxgi::Common::DXGI_FORMAT_R16G16_UNORM,
+                    ),
+                    _ => (
+                        Dxgi::Common::DXGI_FORMAT_R8_UNORM,
+                        Dxgi::Common::DXGI_FORMAT_R8G8_UNORM,
+                    ),
                 };
                 let _ = (y_fmt, uv_fmt);
 
                 // (a) D3D11 plane-copy render into the slot's R8/RG8 targets.
-                eprintln!("[opengl] import_frame: pre-lock lock={:?} ctx={:p}", self.lock, self.lock_ctx);
+                eprintln!(
+                    "[opengl] import_frame: pre-lock lock={:?} ctx={:p}",
+                    self.lock, self.lock_ctx
+                );
                 if let (Some(lock), ctx) = (self.lock, self.lock_ctx) {
-                    unsafe { lock(ctx); }
+                    unsafe {
+                        lock(ctx);
+                    }
                 }
                 eprintln!("[opengl] import_frame: locked");
                 {
@@ -2541,18 +2686,25 @@ mod win {
                     eprintln!("[opengl] import_frame: Flush OK");
                 }
                 if let (Some(unlock), ctx) = (self.unlock, self.lock_ctx) {
-                    unsafe { unlock(ctx); }
+                    unsafe {
+                        unlock(ctx);
+                    }
                 }
                 eprintln!("[opengl] import_frame: unlocked");
 
                 // (b) Hand ownership to OpenGL.
-                let hal = device.as_hal::<wgpu::hal::gles::Api>().ok_or(Error::UnsupportedBackend)?;
+                let hal = device
+                    .as_hal::<wgpu::hal::gles::Api>()
+                    .ok_or(Error::UnsupportedBackend)?;
                 let _gl_guard = hal.context().lock();
                 eprintln!("[opengl] import_frame: GL guard acquired");
                 let slot = &mut self.slots[slot_idx];
                 let names = [slot.y_gl, slot.uv_gl];
                 let resources = [slot.y_wgl, slot.uv_wgl];
-                eprintln!("[opengl] import_frame: pre-dx_lock_objects names={:?} resources={:?}", names, resources);
+                eprintln!(
+                    "[opengl] import_frame: pre-dx_lock_objects names={:?} resources={:?}",
+                    names, resources
+                );
                 let ok = (self.wgl.dx_lock_objects)(
                     self.dx_device,
                     2,
@@ -2587,12 +2739,18 @@ mod win {
         /// shared `queue.submit`. The fence is ordered after all video draws in
         /// that submission; we flush again because our fence is inserted after
         /// wgpu-hal's own flush.
-        pub(super) unsafe fn finish_gl_frames(&mut self, tickets: &[GlInteropTicket]) -> Result<()> {
+        pub(super) unsafe fn finish_gl_frames(
+            &mut self,
+            tickets: &[GlInteropTicket],
+        ) -> Result<()> {
             if tickets.is_empty() {
                 return Ok(());
             }
             unsafe {
-                let hal = self.device.as_hal::<wgpu::hal::gles::Api>().ok_or(Error::UnsupportedBackend)?;
+                let hal = self
+                    .device
+                    .as_hal::<wgpu::hal::gles::Api>()
+                    .ok_or(Error::UnsupportedBackend)?;
                 let _gl_guard = hal.context().lock();
                 let fence = gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
                 gl::Flush();
@@ -2629,9 +2787,12 @@ mod win {
                             gl::DeleteSync(fence);
                             slot.fence = None;
                         }
-                        let hal = self.device.as_hal::<wgpu::hal::gles::Api>().ok_or(Error::UnsupportedBackend)?;
-                         let _gl_guard = hal.context().lock();
-                         Self::unlock_slot(&self.wgl, self.dx_device, slot);
+                        let hal = self
+                            .device
+                            .as_hal::<wgpu::hal::gles::Api>()
+                            .ok_or(Error::UnsupportedBackend)?;
+                        let _gl_guard = hal.context().lock();
+                        Self::unlock_slot(&self.wgl, self.dx_device, slot);
                     }
                 }
             }
@@ -2679,8 +2840,14 @@ mod win {
     ) -> Result<GlInteropSlot> {
         unsafe {
             let (y_fmt, uv_fmt) = match depth {
-                layout::Depth::D16 => (Dxgi::Common::DXGI_FORMAT_R16_UNORM, Dxgi::Common::DXGI_FORMAT_R16G16_UNORM),
-                _ => (Dxgi::Common::DXGI_FORMAT_R8_UNORM, Dxgi::Common::DXGI_FORMAT_R8G8_UNORM),
+                layout::Depth::D16 => (
+                    Dxgi::Common::DXGI_FORMAT_R16_UNORM,
+                    Dxgi::Common::DXGI_FORMAT_R16G16_UNORM,
+                ),
+                _ => (
+                    Dxgi::Common::DXGI_FORMAT_R8_UNORM,
+                    Dxgi::Common::DXGI_FORMAT_R8G8_UNORM,
+                ),
             };
 
             let shared_desc = D3D11::D3D11_TEXTURE2D_DESC {
@@ -2689,7 +2856,10 @@ mod win {
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: y_fmt,
-                SampleDesc: Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11::D3D11_USAGE_DEFAULT,
                 BindFlags: D3D11::D3D11_BIND_RENDER_TARGET.0 as u32
                     | D3D11::D3D11_BIND_SHADER_RESOURCE.0 as u32,
@@ -2704,20 +2874,24 @@ mod win {
             };
 
             let mut y_d3d11 = None;
-            d3d11_device.CreateTexture2D(&shared_desc, None, Some(&mut y_d3d11))
+            d3d11_device
+                .CreateTexture2D(&shared_desc, None, Some(&mut y_d3d11))
                 .map_err(|_| Error::TextureShare)?;
             let y_d3d11 = y_d3d11.ok_or(Error::TextureShare)?;
             let mut uv_d3d11 = None;
-            d3d11_device.CreateTexture2D(&shared_desc_uv, None, Some(&mut uv_d3d11))
+            d3d11_device
+                .CreateTexture2D(&shared_desc_uv, None, Some(&mut uv_d3d11))
                 .map_err(|_| Error::TextureShare)?;
             let uv_d3d11 = uv_d3d11.ok_or(Error::TextureShare)?;
 
             let mut y_rtv = None;
-            d3d11_device.CreateRenderTargetView(&y_d3d11, None, Some(&mut y_rtv))
+            d3d11_device
+                .CreateRenderTargetView(&y_d3d11, None, Some(&mut y_rtv))
                 .map_err(|_| Error::TextureShare)?;
             let y_rtv = y_rtv.ok_or(Error::TextureShare)?;
             let mut uv_rtv = None;
-            d3d11_device.CreateRenderTargetView(&uv_d3d11, None, Some(&mut uv_rtv))
+            d3d11_device
+                .CreateRenderTargetView(&uv_d3d11, None, Some(&mut uv_rtv))
                 .map_err(|_| Error::TextureShare)?;
             let uv_rtv = uv_rtv.ok_or(Error::TextureShare)?;
 
@@ -2804,7 +2978,10 @@ mod win {
             let mut gl_name = 0u32;
             gl::GenTextures(1, &mut gl_name);
             if gl_name == 0 {
-                eprintln!("[opengl] wrap_gl_name: glGenTextures returned 0 ({}x{})", width, height);
+                eprintln!(
+                    "[opengl] wrap_gl_name: glGenTextures returned 0 ({}x{})",
+                    width, height
+                );
                 return Err(Error::TextureShare);
             }
             let wgl_reg = (wgl.dx_register_object)(
@@ -2835,11 +3012,9 @@ mod win {
             // Cast through usize so the raw pointers don't break Send+Sync.
             let dx = dx_device as usize;
             let reg = wgl_reg as usize;
-            let drop_cb: Option<wgpu::hal::DropCallback> = Some(Box::new(move || {
-                unsafe {
-                    unregister(dx as *mut c_void, reg as *mut c_void);
-                    gl::DeleteTextures(1, &gl_name);
-                }
+            let drop_cb: Option<wgpu::hal::DropCallback> = Some(Box::new(move || unsafe {
+                unregister(dx as *mut c_void, reg as *mut c_void);
+                gl::DeleteTextures(1, &gl_name);
             }));
 
             let hal = device
@@ -2852,7 +3027,11 @@ mod win {
                 std::num::NonZeroU32::new(gl_name).ok_or(Error::Unknown)?,
                 &wgpu::hal::TextureDescriptor {
                     label: None,
-                    size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
@@ -2867,7 +3046,11 @@ mod win {
                 hal_tex,
                 &wgpu::TextureDescriptor {
                     label: None,
-                    size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
@@ -2949,7 +3132,10 @@ pub struct OpenGlLinuxFrameAdapter {
 #[cfg(target_os = "linux")]
 impl FrameAdapterBuilder for OpenGlLinuxFrameAdapter {
     unsafe fn new(_decoder: NonNull<ff::AVCodecContext>) -> Result<Self> {
-        Ok(OpenGlLinuxFrameAdapter { imported: None, path: OpenGlInteropPath::DirectPlaneImport })
+        Ok(OpenGlLinuxFrameAdapter {
+            imported: None,
+            path: OpenGlInteropPath::DirectPlaneImport,
+        })
     }
 
     fn supports_format(format: ff::AVPixelFormat) -> bool {
@@ -2999,8 +3185,10 @@ impl FrameAdapter for OpenGlLinuxFrameAdapter {
         self.imported.as_ref().map(|i| {
             let f = i.frame();
             vec![
-                f.y_texture.create_view(&wgpu::TextureViewDescriptor::default()),
-                f.uv_texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                f.y_texture
+                    .create_view(&wgpu::TextureViewDescriptor::default()),
+                f.uv_texture
+                    .create_view(&wgpu::TextureViewDescriptor::default()),
             ]
         })
     }
@@ -3033,8 +3221,9 @@ impl FrameAdapterBuilder for OpenGlWindowsFrameAdapter {
             let d3d11_ctx = (device_ctx.hwctx as *mut super::d3d11va::AVD3D11VADeviceContext)
                 .as_ref()
                 .unwrap();
-            let d3d11_device: std::mem::ManuallyDrop<windows::Win32::Graphics::Direct3D11::ID3D11Device> =
-                std::mem::ManuallyDrop::new(std::mem::transmute((*d3d11_ctx).device));
+            let d3d11_device: std::mem::ManuallyDrop<
+                windows::Win32::Graphics::Direct3D11::ID3D11Device,
+            > = std::mem::ManuallyDrop::new(std::mem::transmute((*d3d11_ctx).device));
 
             // FFmpeg serializes D3D11 immediate-context access via these
             // callbacks. They are valid for the lifetime of the decoder.
@@ -3086,9 +3275,7 @@ impl FrameAdapter for OpenGlWindowsFrameAdapter {
             let mut desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
             decoder_texture.GetDesc(&mut desc);
 
-            if desc.Format
-                != windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12
-            {
+            if desc.Format != windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12 {
                 eprintln!(
                     "[opengl] native WGL interop supports NV12 only, got {:?}",
                     desc.Format

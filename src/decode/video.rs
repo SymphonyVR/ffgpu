@@ -1,4 +1,4 @@
-﻿use crate::{
+use crate::{
     SeekMode,
     decode::{
         Clock, DecoderState, FrameQueue, PacketReceiver, PacketSender, PlayState,
@@ -126,11 +126,7 @@ fn get_cpu_cores() -> usize {
 ///
 /// Returns `(frame_threads, tile_threads)` where `tile_threads` is 0 for
 /// non-AV1 codecs (only dav1d uses tile threading).
-fn calculate_thread_counts(
-    codec_id: ffn::codec::Id,
-    width: u32,
-    height: u32,
-) -> (usize, usize) {
+fn calculate_thread_counts(codec_id: ffn::codec::Id, width: u32, height: u32) -> (usize, usize) {
     let cpu_cores = get_cpu_cores();
     let is_4k = width >= 3840 || height >= 2160;
 
@@ -358,23 +354,14 @@ impl Decoder {
                     let mut hwctx = null_mut();
                     if device_type == ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA {
                         let mut opts: *mut ff::AVDictionary = null_mut();
-                        let dict_ret = ff::av_dict_set(
-                            &mut opts,
-                            c"SHADER".as_ptr(),
-                            c"1".as_ptr(),
-                            0,
-                        );
+                        let dict_ret =
+                            ff::av_dict_set(&mut opts, c"SHADER".as_ptr(), c"1".as_ptr(), 0);
                         if dict_ret < 0 {
                             ff::av_dict_free(&mut opts);
                             return Err(Error::FFmpeg(dict_ret.into()));
                         }
-                        let create_ret = ff::av_hwdevice_ctx_create(
-                            &mut hwctx,
-                            device_type,
-                            null(),
-                            opts,
-                            0,
-                        );
+                        let create_ret =
+                            ff::av_hwdevice_ctx_create(&mut hwctx, device_type, null(), opts, 0);
                         ff::av_dict_free(&mut opts);
                         if create_ret < 0 {
                             return Err(Error::FFmpeg(create_ret.into()));
@@ -491,7 +478,9 @@ pub(crate) struct VideoThread {
     frame_queue: FrameQueue,
     messages: Receiver<Message>,
     read_messages: Sender<ReadMessage>,
+    #[allow(dead_code)] // A/V clock handles kept for ffplay-parity sync work
     clock: Arc<Clock>,
+    #[allow(dead_code)]
     master_clock: Arc<Clock>,
 }
 
@@ -519,13 +508,17 @@ impl VideoThread {
     }
 
     fn run_thread(&mut self) {
-        eprintln!("[VideoThread] STARTED — device_type={:?}", self.decoder.device_type);
+        eprintln!(
+            "[VideoThread] STARTED — device_type={:?}",
+            self.decoder.device_type
+        );
         // Publish the codec context so ffgpu's consumer (Video::update) never
         // dereferences the stale pointer captured at open time. Re-published
         // after every hwaccel-fallback decoder swap below.
-        self.state
-            .video_decoder
-            .store(unsafe { self.decoder.decoder.as_mut_ptr() }, Ordering::Release);
+        self.state.video_decoder.store(
+            unsafe { self.decoder.decoder.as_mut_ptr() },
+            Ordering::Release,
+        );
         let mut packet_serial = 0;
         let mut packet_loop_index = 0;
 
@@ -547,15 +540,19 @@ impl VideoThread {
                 // If D3D11VA is already the current device type and it failed, fall back
                 // to software decoding to avoid an infinite retry loop.
                 #[cfg(target_os = "windows")]
-                let new_device_type = if self.decoder.device_type == ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA {
-                    ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE
-                } else {
-                    ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA
-                };
+                let new_device_type =
+                    if self.decoder.device_type == ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA {
+                        ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE
+                    } else {
+                        ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA
+                    };
                 #[cfg(not(target_os = "windows"))]
                 let new_device_type = ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
 
-                eprintln!("[VideoThread] hardware decode failed, trying {:?}", new_device_type);
+                eprintln!(
+                    "[VideoThread] hardware decode failed, trying {:?}",
+                    new_device_type
+                );
                 log::error!("hardware decode failed, trying {:?}", new_device_type);
                 let mut input = unsafe {
                     ManuallyDrop::new(ffn::format::context::Input::wrap(
@@ -571,9 +568,16 @@ impl VideoThread {
                         );
                     }
                     Err(e) => {
-                        eprintln!("[VideoThread] decoder recreation with {:?} failed: {}, falling back to software", new_device_type, e);
+                        eprintln!(
+                            "[VideoThread] decoder recreation with {:?} failed: {}, falling back to software",
+                            new_device_type, e
+                        );
                         if new_device_type != ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE {
-                            match Decoder::new(&mut input, ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE, None) {
+                            match Decoder::new(
+                                &mut input,
+                                ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE,
+                                None,
+                            ) {
                                 Ok(sw_decoder) => {
                                     self.decoder = sw_decoder;
                                     self.state.video_decoder.store(
@@ -599,13 +603,11 @@ impl VideoThread {
                 // "starts at 0:04" jump). The read thread's seek handler
                 // flushes both packet queues and bumps the serial, which
                 // discards any stale hardware-era frames.
-                let _ = self
-                    .read_messages
-                    .send(ReadMessage::SeekStream {
-                        ts: 0,
-                        mode: SeekMode::Fast,
-                        forward: false,
-                    });
+                let _ = self.read_messages.send(ReadMessage::SeekStream {
+                    ts: 0,
+                    mode: SeekMode::Fast,
+                    forward: false,
+                });
                 self.frame_queue.flush();
             }
 
@@ -613,6 +615,13 @@ impl VideoThread {
                 match message {
                     Message::SkipToTimestamp(ts) => {
                         skip_to_ts = Some(ts);
+                        // Hurry-up accurate seek: decode only reference frames
+                        // during the keyframe→target walk. B-frames are not
+                        // referenced by any other frame, so dropping them keeps
+                        // decoder state valid while roughly halving the walk
+                        // cost on software decode. Restored once the target is
+                        // reached (or the walk hits EOF).
+                        self.decoder.decoder.skip_frame(DiscardLevel::NonRef.into());
                     }
                     Message::SetDiscard(level) => {
                         // Cheap, mid-stream-safe. AV1/dav1d does not corrupt
@@ -641,7 +650,11 @@ impl VideoThread {
                         if diag_count < 20 {
                             diag_count += 1;
                             let fmt = unsafe { (*frame.as_ptr()).format };
-                            eprintln!("[VideoThread] receive_frame OK: format={} (VULKAN={})", fmt, ff::AVPixelFormat::AV_PIX_FMT_VULKAN as i32);
+                            eprintln!(
+                                "[VideoThread] receive_frame OK: format={} (VULKAN={})",
+                                fmt,
+                                ff::AVPixelFormat::AV_PIX_FMT_VULKAN as i32
+                            );
                         }
                         if let Some(pts) = frame.pts() {
                             let offset = loop_timestamp_offset(
@@ -688,14 +701,17 @@ impl VideoThread {
                                 prev_frame = None;
                             }
 
-                            let pts_sec = pts as f64 * f64::from(self.decoder.metadata.time_base);
-
-
+                            let _pts_sec = pts as f64 * f64::from(self.decoder.metadata.time_base);
                         }
                         Some(&mut frame)
                     }
                     Err(ffn::Error::Eof) => {
-                        if diag_count < 20 { eprintln!("[VideoThread] receive_frame EOF"); }
+                        if diag_count < 20 {
+                            eprintln!("[VideoThread] receive_frame EOF");
+                        }
+                        if skip_to_ts.is_some() {
+                            self.decoder.decoder.skip_frame(DiscardLevel::Default.into());
+                        }
                         if let Some(mut prev_frame) = prev_frame.take() {
                             unsafe {
                                 ff::av_frame_move_ref(frame.as_mut_ptr(), prev_frame.as_mut_ptr())
@@ -707,7 +723,9 @@ impl VideoThread {
                         }
                     }
                     Err(ffn::Error::Other { errno: ff::EAGAIN }) => {
-                        if diag_count < 20 { eprintln!("[VideoThread] receive_frame EAGAIN"); }
+                        if diag_count < 20 {
+                            eprintln!("[VideoThread] receive_frame EAGAIN");
+                        }
                         break;
                     }
                     Err(ref e) => {
@@ -741,6 +759,11 @@ impl VideoThread {
                         if skip_to_ts.is_some() {
                             step = self.state.play_state() == PlayState::Paused;
                         }
+                    }
+                    if skip_to_ts.is_some() {
+                        // First frame at/after the accurate-seek target: the
+                        // walk is complete, restore full decode for playback.
+                        self.decoder.decoder.skip_frame(DiscardLevel::Default.into());
                     }
                     skip_to_ts = None;
 
@@ -812,8 +835,7 @@ impl VideoThread {
     }
 
     pub fn run(mut self) -> JoinHandle<()> {
-        let guard =
-            crate::decode::ThreadGuard::new(self.state.thread_count.clone());
+        let guard = crate::decode::ThreadGuard::new(self.state.thread_count.clone());
         std::thread::spawn(move || {
             let _guard = guard;
             self.run_thread();

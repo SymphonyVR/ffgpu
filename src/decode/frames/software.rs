@@ -74,7 +74,10 @@ impl FrameAdapter for SoftwareFrameAdapter {
                         0,
                     );
                     if ret != 0 {
-                        eprintln!("[SoftwareFrameAdapter] av_hwframe_transfer_get_formats failed: {}", ret);
+                        eprintln!(
+                            "[SoftwareFrameAdapter] av_hwframe_transfer_get_formats failed: {}",
+                            ret
+                        );
                         return Err(Error::UnsupportedPixelFormat);
                     }
 
@@ -137,7 +140,10 @@ impl FrameAdapter for SoftwareFrameAdapter {
                 ff::av_hwframe_map(mapped_frame as _, frame as _, ff::AV_HWFRAME_MAP_READ as _)
             };
             if err != 0 {
-                eprintln!("[SoftwareFrameAdapter] av_hwframe_map failed: {}, attempting transfer_data", err);
+                eprintln!(
+                    "[SoftwareFrameAdapter] av_hwframe_map failed: {}, attempting transfer_data",
+                    err
+                );
                 unsafe {
                     let err = ff::av_hwframe_transfer_data(
                         mapped_frame as _,
@@ -146,7 +152,10 @@ impl FrameAdapter for SoftwareFrameAdapter {
                     );
 
                     if err != 0 {
-                        eprintln!("[SoftwareFrameAdapter] av_hwframe_transfer_data failed: {}", err);
+                        eprintln!(
+                            "[SoftwareFrameAdapter] av_hwframe_transfer_data failed: {}",
+                            err
+                        );
                         return Err(Error::UnsupportedPixelFormat);
                     }
                 }
@@ -219,9 +228,10 @@ impl FrameAdapter for SoftwareFrameAdapter {
 
     fn plane_views(&self) -> Option<Vec<wgpu::TextureView>> {
         self.texture.as_ref().map(|texture| {
-            let views = texture.textures.planes.map(|t, _desc| {
-                t.create_view(&wgpu::TextureViewDescriptor::default())
-            });
+            let views = texture
+                .textures
+                .planes
+                .map(|t, _desc| t.create_view(&wgpu::TextureViewDescriptor::default()));
             match views {
                 layout::PlaneLayout::PackedYUV420([y, uv]) => vec![y, uv],
                 layout::PlaneLayout::YUV420([y, u, v]) => vec![y, u, v],

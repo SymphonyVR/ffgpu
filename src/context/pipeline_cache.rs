@@ -83,9 +83,7 @@ impl PipelineCache {
                 };
 
                 let layout_entries: &[_] = match identity.planes {
-                    layout::PlaneLayout::PackedYUV420(_) => {
-                        &[float_view(0), float_view(1)]
-                    }
+                    layout::PlaneLayout::PackedYUV420(_) => &[float_view(0), float_view(1)],
                     layout::PlaneLayout::YUV420(_) | layout::PlaneLayout::YUV444(_) => {
                         &[float_view(0), float_view(1), float_view(2)]
                     }

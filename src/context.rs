@@ -68,35 +68,34 @@ impl Context {
         // device with video decode queue support). When vulkan_video_queue_family_index
         // is None, Vulkan Video is unavailable and we fall back to D3D11VA on Windows,
         // which creates its own D3D11 device context via FFmpeg's standard path.
-        let vulkan_hw_device_ctx =
-            if adapter.get_info().backend == wgpu::Backend::Vulkan
-                && vulkan_video_queue_family_index.is_some()
-            {
-                let mut handles = unsafe {
-                    vulkan_hwcontext::extract_vulkan_device_handles(
-                        &instance, &adapter, &device, &queue,
-                    )
-                }
-                .ok_or(crate::error::Error::HardwareContext)?;
+        let vulkan_hw_device_ctx = if adapter.get_info().backend == wgpu::Backend::Vulkan
+            && vulkan_video_queue_family_index.is_some()
+        {
+            let mut handles = unsafe {
+                vulkan_hwcontext::extract_vulkan_device_handles(
+                    &instance, &adapter, &device, &queue,
+                )
+            }
+            .ok_or(crate::error::Error::HardwareContext)?;
 
-                if let Some(qfi) = vulkan_video_queue_family_index {
-                    handles.video_queue_family_index = qfi;
-                }
+            if let Some(qfi) = vulkan_video_queue_family_index {
+                handles.video_queue_family_index = qfi;
+            }
 
-                let device_extensions = vulkan_device::enabled_device_extensions(&adapter);
-                let instance_extensions = vulkan_device::enabled_instance_extensions(&instance);
+            let device_extensions = vulkan_device::enabled_device_extensions(&adapter);
+            let instance_extensions = vulkan_device::enabled_instance_extensions(&instance);
 
-                let ctx = unsafe {
-                    vulkan_hwcontext::create_ffmpeg_vulkan_device_context(
-                        &handles,
-                        &instance_extensions,
-                        &device_extensions,
-                    )?
-                };
-                Some(AvBufferRefPtr(ctx.as_ptr()))
-            } else {
-                None
+            let ctx = unsafe {
+                vulkan_hwcontext::create_ffmpeg_vulkan_device_context(
+                    &handles,
+                    &instance_extensions,
+                    &device_extensions,
+                )?
             };
+            Some(AvBufferRefPtr(ctx.as_ptr()))
+        } else {
+            None
+        };
 
         Ok(Context {
             instance,
@@ -118,7 +117,8 @@ impl Context {
             self.device.clone(),
             self.queue.clone(),
             self.pipeline_cache.clone(),
-            self.vulkan_hw_device_ctx.map(|p| NonNull::new(p.0).unwrap()),
+            self.vulkan_hw_device_ctx
+                .map(|p| NonNull::new(p.0).unwrap()),
             path,
         )
     }

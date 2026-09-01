@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static AUDIO_DEVICE_CHANGED: AtomicBool = AtomicBool::new(false);
 
 /// Called by platform-specific listeners when a change is detected.
+#[allow(dead_code)] // entry point for native OS listeners; CPAL polling is the active path today
 pub fn mark_audio_device_changed() {
     AUDIO_DEVICE_CHANGED.store(true, Ordering::Relaxed);
 }
@@ -46,14 +47,13 @@ pub fn start_device_monitor() {
 
 #[cfg(target_os = "macos")]
 mod macos_impl {
+    use super::mark_audio_device_changed;
     use coreaudio_sys::{
-        AudioObjectAddPropertyListener, AudioObjectID, AudioObjectPropertyAddress,
-        OSStatus, kAudioHardwarePropertyDefaultOutputDevice,
-        kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
-        kAudioObjectSystemObject,
+        AudioObjectAddPropertyListener, AudioObjectID, AudioObjectPropertyAddress, OSStatus,
+        kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyElementMain,
+        kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject,
     };
     use std::os::raw::c_void;
-    use super::mark_audio_device_changed;
 
     extern "C" fn device_changed(
         _object: AudioObjectID,
@@ -91,27 +91,25 @@ mod macos_impl {
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
+    use super::mark_audio_device_changed;
     use libpulse_binding::{
         context::{
-            subscribe::{Facility, InterestMaskSet, Operation},
             Context, FlagSet,
+            subscribe::{Facility, InterestMaskSet, Operation},
         },
         mainloop::standard::Mainloop,
     };
-    use super::mark_audio_device_changed;
 
     pub fn register_audio_listener() {
         let mut mainloop = Mainloop::new().expect("PulseAudio mainloop");
-        let mut ctx = Context::new(&mainloop, "ffgpu-audio-monitor")
-            .expect("PulseAudio context");
+        let mut ctx = Context::new(&mainloop, "ffgpu-audio-monitor").expect("PulseAudio context");
         ctx.connect(None, FlagSet::NOFLAGS, None)
             .expect("PulseAudio connect");
 
         ctx.set_subscribe_callback(Some(Box::new(|facility, op, _idx| {
             let relevant_facility =
                 facility == Some(Facility::Sink) || facility == Some(Facility::Server);
-            let relevant_op =
-                op == Some(Operation::Changed) || op == Some(Operation::New);
+            let relevant_op = op == Some(Operation::Changed) || op == Some(Operation::New);
             if relevant_facility && relevant_op {
                 log::debug!("[AudioMonitor] Linux: audio device/server changed");
                 mark_audio_device_changed();

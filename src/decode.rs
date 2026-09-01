@@ -12,7 +12,9 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use ffmpeg_next::{self as ffn, sys as ff};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    atomic::{
+        AtomicBool, AtomicI64, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+    },
 };
 use std::time::Duration;
 
@@ -105,7 +107,7 @@ impl DecoderState {
     /// spawning any threads.
     pub fn empty() -> Self {
         DecoderState {
-metadata: ArcSwap::new(Arc::new(Metadata {
+            metadata: ArcSwap::new(Arc::new(Metadata {
                 duration: Duration::ZERO,
                 ..Default::default()
             })),
@@ -156,7 +158,8 @@ metadata: ArcSwap::new(Arc::new(Metadata {
     pub fn kill(&self) {
         // Transition Active → Stopping. Idempotent: re-calling kill() while
         // already Stopping/Stopped is a no-op.
-        self.lifecycle.store(Lifecycle::Stopping as u8, Ordering::SeqCst);
+        self.lifecycle
+            .store(Lifecycle::Stopping as u8, Ordering::SeqCst);
         self.alive.store(false, Ordering::SeqCst);
     }
 
@@ -237,7 +240,13 @@ impl PacketSender {
             .fetch_add(packet.duration(), Ordering::SeqCst);
         let serial = self.metadata.serial.load(Ordering::SeqCst);
         let loop_index = self.metadata.loop_index.load(Ordering::SeqCst);
-        self.tx.send(Packet { packet, serial, loop_index }).unwrap();
+        self.tx
+            .send(Packet {
+                packet,
+                serial,
+                loop_index,
+            })
+            .unwrap();
     }
 
     pub(crate) fn push_null(&self, mut packet: ffn::Packet, stream_index: usize) {
@@ -247,7 +256,11 @@ impl PacketSender {
             .fetch_add(packet.duration(), Ordering::SeqCst);
         let serial = self.metadata.serial.load(Ordering::SeqCst);
         let loop_index = self.metadata.loop_index.load(Ordering::SeqCst);
-        let _ = self.tx.send(Packet { packet, serial, loop_index });
+        let _ = self.tx.send(Packet {
+            packet,
+            serial,
+            loop_index,
+        });
     }
 
     // Packet-count backpressure for the read thread. The old
@@ -350,12 +363,7 @@ impl FrameQueue {
         }
     }
 
-    pub fn send(
-        &self,
-        frame: &mut ffn::Frame,
-        serial: u32,
-        alive: &AtomicBool,
-    ) -> bool {
+    pub fn send(&self, frame: &mut ffn::Frame, serial: u32, alive: &AtomicBool) -> bool {
         let mut dst = loop {
             match self.free_rx.recv_timeout(Duration::from_millis(10)) {
                 Ok(dst) => break dst,
@@ -413,9 +421,12 @@ pub(crate) struct Clock {
 }
 
 impl Clock {
+    #[allow(dead_code)] // ffplay-parity clock constants; consumed by sync_to_slave and future A/V sync
     pub const NO_SYNC_THRESHOLD: f64 = 10.;
+    #[allow(dead_code)]
     pub const SYNC_MIN: f64 = 0.04;
     pub const SYNC_MAX: f64 = 0.1;
+    #[allow(dead_code)]
     pub const FRAME_DUPLICATION_THRESHOLD: f64 = 0.1;
 
     pub fn new(queue: Arc<PacketQueueMetadata>) -> Self {
@@ -456,6 +467,7 @@ impl Clock {
         self.serial.store(serial, Ordering::Relaxed);
     }
 
+    #[allow(dead_code)] // ffplay-parity slave-clock sync; reserved for multi-stream playback
     pub fn sync_to_slave(&self, slave: &Clock) {
         let clock = self.get();
         let slave_clock = slave.get();
@@ -515,8 +527,11 @@ pub(crate) fn container_start_seconds(state: &DecoderState) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecoderState, PacketSender, audio::AudioStream, packet_queue, read::Metadata, video::VideoStream};
-use ffmpeg_next::Packet;
+    use super::{
+        DecoderState, PacketSender, audio::AudioStream, packet_queue, read::Metadata,
+        video::VideoStream,
+    };
+    use ffmpeg_next::Packet;
     use ffmpeg_next::Rational;
     use std::time::Duration;
 
@@ -532,20 +547,34 @@ use ffmpeg_next::Packet;
     #[test]
     fn seek_target_adds_start_time_and_clamps() {
         let no_start = state_with_start_time(ffmpeg_next::sys::AV_NOPTS_VALUE);
-        assert_eq!(super::seek_target_us(&no_start, Duration::from_secs(5)), 5_000_000);
+        assert_eq!(
+            super::seek_target_us(&no_start, Duration::from_secs(5)),
+            5_000_000
+        );
 
         let shifted = state_with_start_time(4_000_000);
-        assert_eq!(super::seek_target_us(&shifted, Duration::from_secs(5)), 9_000_000);
+        assert_eq!(
+            super::seek_target_us(&shifted, Duration::from_secs(5)),
+            9_000_000
+        );
         // Relative position below the origin is clamped up to the origin.
         assert_eq!(super::seek_target_us(&shifted, Duration::ZERO), 4_000_000);
     }
 
     #[test]
     fn container_start_seconds_projects_reports_offset_only_when_positive() {
-        assert_eq!(super::container_start_seconds(&state_with_start_time(4_000_000)), 4.0);
-        assert_eq!(super::container_start_seconds(&state_with_start_time(0)), 0.0);
         assert_eq!(
-            super::container_start_seconds(&state_with_start_time(ffmpeg_next::sys::AV_NOPTS_VALUE)),
+            super::container_start_seconds(&state_with_start_time(4_000_000)),
+            4.0
+        );
+        assert_eq!(
+            super::container_start_seconds(&state_with_start_time(0)),
+            0.0
+        );
+        assert_eq!(
+            super::container_start_seconds(&state_with_start_time(
+                ffmpeg_next::sys::AV_NOPTS_VALUE
+            )),
             0.0,
         );
     }
@@ -555,8 +584,11 @@ use ffmpeg_next::Packet;
         let state = DecoderState::empty();
         let duration = Duration::from_secs(2142);
 
-state.install(
-            Metadata { duration, ..Default::default() },
+        state.install(
+            Metadata {
+                duration,
+                ..Default::default()
+            },
             VideoStream::dummy(),
             AudioStream::dummy(),
         );
@@ -567,20 +599,15 @@ state.install(
     #[test]
     fn loop_timestamp_offset_uses_container_duration() {
         let state = DecoderState::empty();
-        state
-            .metadata
-            .store(std::sync::Arc::new(Metadata {
-duration: Duration::from_secs(2),
-                ..Default::default()
-            }));
+        state.metadata.store(std::sync::Arc::new(Metadata {
+            duration: Duration::from_secs(2),
+            ..Default::default()
+        }));
 
-        assert_eq!(
-            super::loop_timestamp_offset(&state, 3, Rational(1, 1)),
-            6,
-        );
+        assert_eq!(super::loop_timestamp_offset(&state, 3, Rational(1, 1)), 6,);
     }
 
-#[test]
+    #[test]
     fn packet_queue_tags_prefetched_loop_packets() {
         let (sender, receiver, _) = packet_queue();
         sender.set_loop_index(2);

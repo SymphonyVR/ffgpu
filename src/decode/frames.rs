@@ -41,8 +41,6 @@ pub struct GlInteropTicket {
     pub slot_id: u8,
 }
 
-
-
 // needs to be separate from FrameAdapater to be dyn compatible
 pub(crate) trait FrameAdapterBuilder: FrameAdapter + Sized {
     unsafe fn new(decoder: NonNull<ff::AVCodecContext>) -> Result<Self>;
@@ -82,6 +80,7 @@ pub(crate) trait FrameAdapter {
     /// Abandon a locked slot whose draw was never recorded (render error,
     /// early return, clipping). Unlocks the WGL object immediately so the slot
     /// returns to the Free state. No-op for non-ring adapters (default).
+    #[allow(dead_code)] // GL-interop cancel path reserved for the render-error handler
     fn cancel_gl_frame(&mut self, _ticket: GlInteropTicket) -> Result<()> {
         Ok(())
     }
@@ -282,7 +281,9 @@ impl FrameDecoder {
                 | Err(error @ Error::Probe(_)) => {
                     let frame_fmt = (*frame.as_ptr()).format;
                     if frame_fmt == ff::AVPixelFormat::AV_PIX_FMT_VULKAN as i32 {
-                        eprintln!("[frames] Vulkan zero-copy failed and CPU transfer is not supported");
+                        eprintln!(
+                            "[frames] Vulkan zero-copy failed and CPU transfer is not supported"
+                        );
                         return Err(Error::UnsupportedBackend);
                     }
                     if !allow_cpu_fallback(adapter, frame_fmt) {
@@ -384,7 +385,10 @@ impl FrameDecoder {
     /// Whether at least one decoded frame has reached the active adapter.
     /// The RGBA fallback texture is uninitialized until that happens.
     pub fn has_frame(&self) -> bool {
-        self.adapter.as_ref().and_then(|adapter| adapter.bind_group()).is_some()
+        self.adapter
+            .as_ref()
+            .and_then(|adapter| adapter.bind_group())
+            .is_some()
     }
 
     /// YUV plane bind group (`bg0`) produced by the active frame adapter.
@@ -449,6 +453,7 @@ impl FrameDecoder {
 
     /// Abandon a locked slot whose draw was never recorded. Delegates to the
     /// active adapter (no-op for non-ring adapters).
+    #[allow(dead_code)] // GL-interop cancel path reserved for the render-error handler
     pub fn cancel_gl_frame(&mut self, ticket: GlInteropTicket) -> Result<()> {
         if let Some(a) = self.adapter.as_mut() {
             a.cancel_gl_frame(ticket)?;

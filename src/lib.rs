@@ -19,7 +19,7 @@ pub use probe::{probe_hardware_decoding_support, probe_software_required};
 #[cfg(feature = "video")]
 pub use software_video::{
     ColorMatrix, MasterClock, PixelFormat, SoftwareContext, SoftwareDecodeVideo, SoftwareFrame,
-    SoftwareFrameReceiver, SoftwareVideo, YuvRange,
+    SoftwareFrameReceiver, YuvRange,
 };
 pub use video::{SeekMode, Video};
 pub use vulkan_device::{VulkanVideoDevice, create_vulkan_device_for_video};

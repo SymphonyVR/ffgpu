@@ -42,16 +42,17 @@
 //! video).
 
 use crate::{
-    SeekMode,
     decode::{
-        self, Clock, DecoderState, Frame, FrameQueue, PacketQueueMetadata,
+        self,
         audio::{self, AudioSink, AudioStream, AudioThread},
         read::{Input, ReadMessage, ReadThread},
         video::{self, VideoStream},
+        Clock, DecoderState, Frame, FrameQueue, PacketQueueMetadata,
     },
     error::Result,
+    SeekMode,
 };
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 
 /// Public alias for the receiver side of the frame channel. Engine
 /// worker threads hold one of these and call `.recv()` to receive
@@ -71,6 +72,9 @@ pub enum MasterClock {
     /// unavailable; video is paced to wall-clock only.
     System,
 }
+
+const SYNC_THRESHOLD_MS: f64 = 100.0;
+const EARLY_RETRY_MAX_MS: f64 = 50.0;
 
 impl Default for MasterClock {
     fn default() -> Self {
@@ -131,7 +135,7 @@ impl RollingGap {
 use ffmpeg_next::{self as ffn, sys as ff};
 use std::{
     path::Path,
-    sync::{Arc, atomic::Ordering},
+    sync::{atomic::Ordering, Arc},
     thread::JoinHandle,
     time::Duration,
 };
@@ -505,7 +509,7 @@ impl SoftwareFrame {
 
     fn rgb_to_rgba(&self, has_alpha: bool) -> Vec<u8> {
         let pixel_count = (self.width * self.height) as usize;
-        let channels = if has_alpha { 4 } else { 3 };
+        let _channels = if has_alpha { 4 } else { 3 };
         let mut rgba = vec![0u8; pixel_count * 4];
         if has_alpha {
             rgba.copy_from_slice(&self.y[..pixel_count * 4]);
@@ -580,6 +584,14 @@ pub struct SoftwareDecodeVideo {
     /// timing — the consumer can call `update()` to pace, then
     /// `frame()` to get the latest frame.
     queued_frame: Option<SoftwareFrame>,
+    /// Raw frame held while video is early relative to the audio master clock.
+    pending_frame: Option<Frame>,
+    /// PTS of the last frame considered by the presentation loop.
+    last_seen_pts_sec: Option<f64>,
+    /// Loop generation used to discard stale timing state at a loop boundary.
+    last_loop_generation: u64,
+    /// Most recent audio-minus-video gap in milliseconds for diagnostics.
+    last_sync_gap_ms: Option<f64>,
 
     /// Audio clock shared with the AudioSink. Used by `update()`
     /// to compute the gap between video PTS and audio PTS. Cloned
@@ -599,6 +611,7 @@ pub struct SoftwareDecodeVideo {
 /// Backwards-compatible alias. Existing code importing
 /// `ffgpu::SoftwareVideo` continues to work for one release.
 #[deprecated(note = "Use ffgpu::SoftwareDecodeVideo instead")]
+#[allow(dead_code)] // compatibility alias kept through the deprecation window
 pub type SoftwareVideo = SoftwareDecodeVideo;
 
 impl SoftwareDecodeVideo {
@@ -734,6 +747,10 @@ impl SoftwareDecodeVideo {
                 last_video_pts: 0,
                 last_audio_pts_ms: 0.0,
                 queued_frame: None,
+                pending_frame: None,
+                last_seen_pts_sec: None,
+                last_loop_generation: 0,
+                last_sync_gap_ms: None,
                 audio_clock,
                 frame_y: Vec::new(),
                 frame_uv: Vec::new(),
@@ -831,6 +848,11 @@ impl SoftwareDecodeVideo {
         self.last_video_pts = 0;
         self.last_audio_pts_ms = 0.0;
         self.queued_frame = None;
+        if let Some(frame) = self.pending_frame.take() {
+            self.state.video_stream.load().frames.release(frame);
+        }
+        self.last_seen_pts_sec = None;
+        self.last_sync_gap_ms = None;
 
         let _ = self
             .read_messages
@@ -896,6 +918,11 @@ impl SoftwareDecodeVideo {
         self.current_rate
     }
 
+    /// Most recent audio-minus-video timing gap in milliseconds.
+    pub fn sync_gap_ms(&self) -> Option<f64> {
+        self.last_sync_gap_ms
+    }
+
     /// Set the master clock source for A/V sync. `Audio` (default)
     /// uses the audio thread's PTS as the reference; `System` uses
     /// wall-clock only. The engine should call this when it
@@ -906,6 +933,7 @@ impl SoftwareDecodeVideo {
             // Reset the rolling buffer to avoid using stale samples
             // from the previous master clock.
             self.rolling_gap.clear();
+            self.last_sync_gap_ms = None;
         }
     }
 
@@ -946,28 +974,44 @@ impl SoftwareDecodeVideo {
     /// # }
     /// ```
     pub fn update(&mut self) -> Result<(Duration, bool)> {
+        let video_frame_queue = self.state.video_stream.load().frames.clone();
+        let loop_generation = self.state.loop_events.load(Ordering::Acquire);
+        if loop_generation != self.last_loop_generation {
+            if let Some(frame) = self.pending_frame.take() {
+                video_frame_queue.release(frame);
+            }
+            self.rolling_gap.clear();
+            self.current_rate = self.requested_rate;
+            self.last_video_pts = 0;
+            self.last_audio_pts_ms = 0.0;
+            self.last_seen_pts_sec = None;
+            self.last_sync_gap_ms = None;
+            self.last_loop_generation = loop_generation;
+        }
+
         // Get audio position from the audio clock (master clock).
         // This is the same Arc<Clock> that the AudioSink holds, so
         // readings are consistent with the cpal callback's view of
         // "now".
         let master_pts_ms = match self.master_clock {
             MasterClock::Audio => self.audio_clock.get().map(|pts| pts * 1000.0),
-            MasterClock::System => {
-                use std::time::{SystemTime, UNIX_EPOCH};
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs_f64() * 1000.0)
-                    .ok()
-            }
+            // The bridge's elapsed-time pacing is the system-clock path. A
+            // Unix-epoch value cannot be compared with media PTS values.
+            MasterClock::System => None,
         };
 
-        // Pull one frame from the FrameQueue. Drop stale frames in a loop when
-        // the decoder is behind the audio clock, but keep the newest available
-        // frame so a slow decoder does not turn into a black screen.
-        let video_frame_queue = self.state.video_stream.load().frames.clone();
-        let mut next_frame = video_frame_queue.try_next();
+        // Pull one frame from the FrameQueue. Hold an early frame and drop late
+        // frames only when a newer frame is available, keeping the displayed
+        // image moving instead of allowing queue backlog to become A/V lag.
+        let mut next_frame = self
+            .pending_frame
+            .take()
+            .or_else(|| video_frame_queue.try_next());
         let mut frame_decoded = false;
         let mut frame_for_queue = None;
+        let frame_rate = self.state.video_stream.load().metadata.framerate;
+        let fallback_duration = frame_duration_seconds(f64::NAN, frame_rate);
+        let mut frame_duration = fallback_duration;
         while let Some(f) = next_frame {
             let current_serial = self
                 .state
@@ -992,29 +1036,54 @@ impl SoftwareDecodeVideo {
                     (*raw).pts
                 }
             };
-            if pts != ffn::ffi::AV_NOPTS_VALUE {
-                self.last_video_pts = pts;
-            }
+            let pts_sec = (pts != ffn::ffi::AV_NOPTS_VALUE)
+                .then(|| pts as f64 * f64::from(self.stream_time_base()));
 
             // Compute gap only while the audio clock is valid. A missing clock
             // during a seek is not audio at time zero and must not drive rate
             // adjustment.
-            let gap_ms = master_pts_ms.map(|audio_pts_ms| {
-                let video_pts_ms =
-                    self.last_video_pts as f64 * f64::from(self.stream_time_base()) * 1000.0;
+            let gap_ms = master_pts_ms.zip(pts_sec).map(|(audio_pts_ms, pts_sec)| {
+                let gap_ms = audio_pts_ms - pts_sec * 1000.0;
                 self.last_audio_pts_ms = audio_pts_ms;
-                audio_pts_ms - video_pts_ms
+                self.last_sync_gap_ms = Some(gap_ms);
+                gap_ms
             });
-
-            // Keep one frame when the decoder has no newer replacement.
-            if gap_ms.is_some_and(|gap| gap > 500.0) && video_frame_queue.queued_len() > 0 {
-                video_frame_queue.release(f);
-                next_frame = video_frame_queue.try_next();
-                continue;
-            }
 
             if let Some(gap_ms) = gap_ms {
                 self.rolling_gap.push(gap_ms);
+
+                // Do not present a frame substantially ahead of audio. Keep the
+                // decoded frame so the next update can present it once audio
+                // reaches its PTS.
+                if gap_ms < -SYNC_THRESHOLD_MS {
+                    let retry_ms = (-gap_ms - SYNC_THRESHOLD_MS).clamp(1.0, EARLY_RETRY_MAX_MS);
+                    self.pending_frame = Some(f);
+                    frame_duration = retry_ms / 1000.0;
+                    break;
+                }
+
+                // Drop stale frames only when a newer frame is available. If the
+                // decoder is itself slow, showing the only frame is preferable
+                // to freezing the picture while audio continues.
+                if gap_ms > SYNC_THRESHOLD_MS && video_frame_queue.queued_len() > 0 {
+                    if let Some(pts_sec) = pts_sec {
+                        self.last_seen_pts_sec = Some(pts_sec);
+                        self.last_video_pts = pts;
+                    }
+                    video_frame_queue.release(f);
+                    next_frame = video_frame_queue.try_next();
+                    continue;
+                }
+            }
+
+            if let Some(pts_sec) = pts_sec {
+                let previous_pts = self.last_seen_pts_sec;
+                frame_duration = frame_duration_seconds(
+                    previous_pts.map_or(f64::NAN, |previous| pts_sec - previous),
+                    frame_rate,
+                );
+                self.last_seen_pts_sec = Some(pts_sec);
+                self.last_video_pts = pts;
             }
 
             // Convert to SoftwareFrame using pre-allocated plane buffers to
@@ -1067,18 +1136,10 @@ impl SoftwareDecodeVideo {
         // hysteresis: 200ms triggers catch-up, 50ms releases.
         self.adjust_playback_rate();
 
-        // Compute wait_duration: the time the consumer should sleep
-        // before the next frame. We use the inverse of the
-        // playback rate so the video PTS advances at the desired
-        // speed.
-        let fr = self.state.video_stream.load().metadata.framerate;
-        let base_frame_duration = if fr.1 > 0 && fr.0 > 0 {
-            Duration::from_secs_f64(f64::from(fr.invert()))
-        } else {
-            // Fallback: 30fps
-            Duration::from_secs_f64(1.0 / 30.0)
-        };
-        let wait = base_frame_duration.div_f32(self.current_rate);
+        // Compute wait_duration from the actual PTS interval. This preserves
+        // variable-frame-rate timing; average FPS is only the invalid-PTS
+        // fallback.
+        let wait = Duration::from_secs_f64(frame_duration / f64::from(self.current_rate));
 
         Ok((wait, frame_decoded))
     }
@@ -1130,6 +1191,16 @@ impl SoftwareDecodeVideo {
     }
 }
 
+fn frame_duration_seconds(pts_delta: f64, frame_rate: ffn::Rational) -> f64 {
+    if pts_delta.is_finite() && pts_delta > 0.0 && pts_delta <= 3600.0 {
+        pts_delta
+    } else if frame_rate.0 > 0 && frame_rate.1 > 0 {
+        f64::from(frame_rate.invert())
+    } else {
+        1.0 / 30.0
+    }
+}
+
 impl Drop for SoftwareDecodeVideo {
     fn drop(&mut self) {
         self.state.kill();
@@ -1150,6 +1221,32 @@ impl Drop for SoftwareDecodeVideo {
 
 unsafe impl Send for SoftwareDecodeVideo {}
 unsafe impl Sync for SoftwareDecodeVideo {}
+
+#[cfg(test)]
+mod tests {
+    use super::frame_duration_seconds;
+    use ffmpeg_next::Rational;
+
+    #[test]
+    fn software_pacing_prefers_pts_delta() {
+        assert_eq!(frame_duration_seconds(0.041, Rational(60, 1)), 0.041);
+    }
+
+    #[test]
+    fn software_pacing_falls_back_to_average_fps() {
+        let expected = 1.0 / 30.0;
+        assert!(
+            (frame_duration_seconds(f64::NAN, Rational(30, 1)) - expected).abs() < f64::EPSILON
+        );
+        assert!((frame_duration_seconds(-1.0, Rational(30, 1)) - expected).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn software_pacing_rejects_timestamp_discontinuities() {
+        let expected = 1.0 / 24.0;
+        assert!((frame_duration_seconds(3601.0, Rational(24, 1)) - expected).abs() < f64::EPSILON);
+    }
+}
 
 impl Default for PacketQueueMetadata {
     fn default() -> Self {

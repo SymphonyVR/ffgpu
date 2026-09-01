@@ -67,20 +67,26 @@ fn supported_video_decode_extensions(
     raw_instance: &ash::Instance,
     physical_device: ash::vk::PhysicalDevice,
 ) -> Vec<&'static std::ffi::CStr> {
-    let supported = match unsafe {
-        raw_instance.enumerate_device_extension_properties(physical_device)
-    } {
-        Ok(props) => props,
-        Err(e) => {
-            log::warn!("[VulkanVideo] Failed to enumerate device extensions: {:?}", e);
-            return Vec::new();
-        }
-    };
+    let supported =
+        match unsafe { raw_instance.enumerate_device_extension_properties(physical_device) } {
+            Ok(props) => props,
+            Err(e) => {
+                log::warn!(
+                    "[VulkanVideo] Failed to enumerate device extensions: {:?}",
+                    e
+                );
+                return Vec::new();
+            }
+        };
 
     // Build a set of supported extension name strings for fast lookup.
     let supported_names: std::collections::HashSet<String> = supported
         .iter()
-        .filter_map(|p| p.extension_name_as_c_str().ok().map(|s| s.to_string_lossy().into_owned()))
+        .filter_map(|p| {
+            p.extension_name_as_c_str()
+                .ok()
+                .map(|s| s.to_string_lossy().into_owned())
+        })
         .collect();
 
     // Combine video decode extensions with optional FFmpeg extensions.
@@ -104,12 +110,18 @@ fn supported_video_decode_extensions(
 
     eprintln!(
         "[VulkanVideo] Supported extensions for FFmpeg: {:?}",
-        result.iter().map(|e| e.to_string_lossy()).collect::<Vec<_>>()
+        result
+            .iter()
+            .map(|e| e.to_string_lossy())
+            .collect::<Vec<_>>()
     );
     if !skipped.is_empty() {
         eprintln!(
             "[VulkanVideo] Skipped unsupported extensions: {:?}",
-            skipped.iter().map(|e| e.to_string_lossy()).collect::<Vec<_>>()
+            skipped
+                .iter()
+                .map(|e| e.to_string_lossy())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -196,9 +208,8 @@ pub fn create_vulkan_device_for_video(
     let physical_device = hal_adapter.raw_physical_device();
 
     // Query queue families to find one with video decode support
-    let queue_families = unsafe {
-        raw_instance.get_physical_device_queue_family_properties(physical_device)
-    };
+    let queue_families =
+        unsafe { raw_instance.get_physical_device_queue_family_properties(physical_device) };
 
     let mut video_queue_family_index = None;
     let mut graphics_queue_family_index = None;
@@ -207,7 +218,9 @@ pub fn create_vulkan_device_for_video(
     for (i, props) in queue_families.iter().enumerate() {
         let i = i as u32;
         if props.queue_flags.contains(ash::vk::QueueFlags::GRAPHICS)
-            && props.queue_flags.contains(ash::vk::QueueFlags::VIDEO_DECODE_KHR)
+            && props
+                .queue_flags
+                .contains(ash::vk::QueueFlags::VIDEO_DECODE_KHR)
         {
             video_queue_family_index = Some(i);
             graphics_queue_family_index = Some(i);
@@ -222,24 +235,25 @@ pub fn create_vulkan_device_for_video(
     if video_queue_family_index.is_none() {
         for (i, props) in queue_families.iter().enumerate() {
             let i = i as u32;
-            if props.queue_flags.contains(ash::vk::QueueFlags::VIDEO_DECODE_KHR) {
+            if props
+                .queue_flags
+                .contains(ash::vk::QueueFlags::VIDEO_DECODE_KHR)
+            {
                 video_queue_family_index = Some(i);
                 break;
             }
         }
     }
 
-    let video_queue_family_index = video_queue_family_index
-        .ok_or_else(|| {
-            log::error!("[VulkanVideo] No queue family with VIDEO_DECODE_KHR found");
-            Error::HardwareContext
-        })?;
+    let video_queue_family_index = video_queue_family_index.ok_or_else(|| {
+        log::error!("[VulkanVideo] No queue family with VIDEO_DECODE_KHR found");
+        Error::HardwareContext
+    })?;
 
-    let graphics_queue_family_index = graphics_queue_family_index
-        .ok_or_else(|| {
-            log::error!("[VulkanVideo] No queue family with GRAPHICS found");
-            Error::HardwareContext
-        })?;
+    let graphics_queue_family_index = graphics_queue_family_index.ok_or_else(|| {
+        log::error!("[VulkanVideo] No queue family with GRAPHICS found");
+        Error::HardwareContext
+    })?;
 
     log::info!(
         "[VulkanVideo] Graphics queue family: {}, Video decode queue family: {}",
@@ -259,8 +273,7 @@ pub fn create_vulkan_device_for_video(
     // Query which video decode extensions are actually supported by this
     // physical device. Requesting unsupported extensions causes vkCreateDevice
     // to return ERROR_EXTENSION_NOT_PRESENT, which wgpu-hal turns into a panic.
-    let supported_video_exts =
-        supported_video_decode_extensions(raw_instance, physical_device);
+    let supported_video_exts = supported_video_decode_extensions(raw_instance, physical_device);
 
     let video_qfi = video_queue_family_index;
     let graphics_qfi = graphics_queue_family_index;
@@ -305,14 +318,17 @@ pub fn create_vulkan_device_for_video(
     // Wrap the hal device as a wgpu device
     let (device, queue) = unsafe {
         adapter
-            .create_device_from_hal(hal_device, &wgpu::DeviceDescriptor {
-                label: Some("NexaEngine Vulkan Video Device"),
-                required_features,
-                required_limits: required_limits.clone(),
-                memory_hints: wgpu::MemoryHints::default(),
-                experimental_features: wgpu::ExperimentalFeatures::default(),
-                trace: wgpu::Trace::Off,
-            })
+            .create_device_from_hal(
+                hal_device,
+                &wgpu::DeviceDescriptor {
+                    label: Some("NexaEngine Vulkan Video Device"),
+                    required_features,
+                    required_limits: required_limits.clone(),
+                    memory_hints: wgpu::MemoryHints::default(),
+                    experimental_features: wgpu::ExperimentalFeatures::default(),
+                    trace: wgpu::Trace::Off,
+                },
+            )
             .map_err(|e| {
                 log::error!("[VulkanVideo] Failed to create wgpu device: {:?}", e);
                 Error::HardwareContext

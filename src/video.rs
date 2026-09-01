@@ -1,22 +1,24 @@
 use crate::{
     context::pipeline_cache::PipelineCache,
     decode::{
-        Clock, DecoderState, Frame, FrameQueue, PlayState,
         audio::{self, AudioSink, AudioThread},
         frames, packet_queue,
         read::{Input, ReadMessage, ReadThread},
-        sink_thread, video,
+        sink_thread, video, Clock, DecoderState, Frame, FrameQueue, PlayState,
     },
     error::{Error, Result},
 };
-use crossbeam_channel::{Sender, unbounded};
+use crossbeam_channel::{unbounded, Sender};
 use ffmpeg_next::{self as ffn, sys as ff};
 use std::ptr::NonNull;
 use std::sync::Mutex;
 use std::{
     ops::Add,
     path::Path,
-    sync::{Arc, atomic::{AtomicU64, Ordering}},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     thread::JoinHandle,
     time::Duration,
 };
@@ -30,6 +32,7 @@ pub enum SeekMode {
 enum FrameResponse {
     Continue,
     Retry,
+    #[allow(dead_code)] // reserved re-decode response for the seek path
     Requeue,
 }
 
@@ -92,7 +95,6 @@ pub struct Video {
     last_serial: u32,
     queued_frame: Option<Frame>,
     step_needs_copy: u8,
-
 }
 
 impl Video {
@@ -171,8 +173,7 @@ impl Video {
             preferred_device_type_for_backend(backend)
         };
 
-        let video_decoder =
-            video::Decoder::new(&mut input.format_ctx, device_type, hw_device_ctx)?;
+        let video_decoder = video::Decoder::new(&mut input.format_ctx, device_type, hw_device_ctx)?;
         let hw_unsupported = video_decoder.unsupported.clone();
         let audio_decoder = audio::Decoder::new(&mut input)?;
         let has_audio = audio_decoder.is_some();
@@ -422,7 +423,7 @@ impl Video {
                 decoder,
                 &frame.frame,
             ) {
-                Ok(()) => {},
+                Ok(()) => {}
                 Err(Error::UnsupportedBackend) | Err(Error::Probe(_)) => {
                     eprintln!("[Video] hardware decode not viable (probe), switching decoder");
                     self.hw_unsupported.store(true, Ordering::Relaxed);
@@ -482,7 +483,8 @@ impl Video {
         // (the handler clears is_eof), does NOT call self.flush(), so it does
         // not drain the frame queues or re-expand the decoder's frame-thread
         // buffer set (the previous memory leak).
-        if video_frame_queue.queued_len() == 0
+        if self.queued_frame.is_none()
+            && video_frame_queue.queued_len() == 0
             && self.state.is_eof.load(Ordering::SeqCst)
             && self.looping
             && play_state != PlayState::Paused
@@ -494,7 +496,9 @@ impl Video {
             });
         }
 
-        if play_state == PlayState::Paused || video_frame_queue.queued_len() == 0 {
+        if play_state == PlayState::Paused
+            || (self.queued_frame.is_none() && video_frame_queue.queued_len() == 0)
+        {
             return Ok((Duration::from_millis(50), false));
         }
 
@@ -519,28 +523,43 @@ impl Video {
                 .take()
                 .or_else(|| video_frame_queue.try_next());
             if let Some(frame) = frame {
-                let current_serial = self.state.video_stream.load().packets.metadata.serial.load(Ordering::SeqCst);
+                let current_serial = self
+                    .state
+                    .video_stream
+                    .load()
+                    .packets
+                    .metadata
+                    .serial
+                    .load(Ordering::SeqCst);
                 if frame.serial == current_serial {
                     if let Some(sync_ref_sec) = sync_ref {
-                        let pts_sec = unsafe { (*frame.frame.as_ptr()).best_effort_timestamp } as f64 * time_base;
+                        let pts_sec = unsafe { (*frame.frame.as_ptr()).best_effort_timestamp }
+                            as f64
+                            * time_base;
                         // Clamp sync_ref to prevent runaway clock from evicting entire queue
                         let last_video_pts_sec = self.last_pts as f64 * time_base;
                         let sync_ref_sec = sync_ref_sec.min(last_video_pts_sec + 0.5);
                         let diff = pts_sec - sync_ref_sec;
 
-                        // Presentation is already paced by the engine from frame PTS.
-                        // Audio sync may drop late frames, but delaying future frames here
-                        // would pace the same frame twice and halve playback speed.
-                        if diff < -0.200 && queued_len > 2 {
-                            self.last_pts = unsafe { (*frame.frame.as_ptr()).best_effort_timestamp };
+                        // Audio is the master clock. Hold early frames and drop late
+                        // frames only when a newer frame is available, matching the
+                        // software consumer's policy without allowing queue backlog
+                        // to become visible A/V lag.
+                        if diff > Clock::SYNC_MAX {
+                            let retry = (diff - Clock::SYNC_MAX).clamp(0.001, 0.050);
+                            self.queued_frame = Some(frame);
+                            duration = Duration::from_secs_f64(retry);
+                            break;
+                        }
+                        if diff < -Clock::SYNC_MAX && queued_len > 0 {
+                            self.last_pts =
+                                unsafe { (*frame.frame.as_ptr()).best_effort_timestamp };
                             self.last_serial = frame.serial;
                             video_frame_queue.release(frame);
                             continue;
                         }
-
                     }
-
-                    }
+                }
 
                 let response = self.update_frame(encoder, &frame, queued_len, &mut duration)?;
                 match response {
@@ -702,7 +721,8 @@ impl Video {
     /// software path is slower than video-rs's async decoder.
     #[inline]
     pub fn is_software_fallback(&self) -> bool {
-        self.hw_unsupported.load(std::sync::atomic::Ordering::Relaxed)
+        self.hw_unsupported
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn position(&self) -> Duration {
@@ -883,7 +903,9 @@ mod tests {
         let expected = 1.0 / 30.0;
         assert!((frame_duration_seconds(0.0, Rational(30, 1)) - expected).abs() < f64::EPSILON);
         assert!((frame_duration_seconds(-1.0, Rational(30, 1)) - expected).abs() < f64::EPSILON);
-        assert!((frame_duration_seconds(f64::NAN, Rational(30, 1)) - expected).abs() < f64::EPSILON);
+        assert!(
+            (frame_duration_seconds(f64::NAN, Rational(30, 1)) - expected).abs() < f64::EPSILON
+        );
     }
 
     #[test]

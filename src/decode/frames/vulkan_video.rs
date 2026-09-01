@@ -44,7 +44,7 @@ use crate::{
     context::{layout, pipeline_cache::PipelineCache},
     decode::{
         frames::FrameAdapterBuilder,
-        vulkan_hwcontext::{AVVkFrame, AVVulkanFramesContext, AV_NUM_DATA_POINTERS},
+        vulkan_hwcontext::{AV_NUM_DATA_POINTERS, AVVkFrame, AVVulkanFramesContext},
     },
     error::{Error, Result},
 };
@@ -67,7 +67,10 @@ fn wgpu_to_vk_format(format: wgpu::TextureFormat) -> Result<ash::vk::Format> {
         Tf::R16Unorm => F::R16_UNORM,
         Tf::Rg16Unorm => F::R16G16_UNORM,
         _ => {
-            log::error!("[VulkanVideo] Unsupported presentation texture format: {:?}", format);
+            log::error!(
+                "[VulkanVideo] Unsupported presentation texture format: {:?}",
+                format
+            );
             return Err(Error::UnsupportedBackend);
         }
     };
@@ -160,8 +163,7 @@ unsafe fn create_raw_vulkan_texture(
         })?
     };
 
-    let mem_requirements =
-        unsafe { raw_device.get_image_memory_requirements(vk_image) };
+    let mem_requirements = unsafe { raw_device.get_image_memory_requirements(vk_image) };
 
     let mem_properties =
         unsafe { raw_instance.get_physical_device_memory_properties(physical_device) };
@@ -418,10 +420,11 @@ impl VulkanCopyContext {
         F: FnOnce(ash::vk::CommandBuffer),
     {
         unsafe {
-            let slot_index = self
-                .slots
-                .iter()
-                .position(|slot| self.raw_device.get_fence_status(slot.fence).unwrap_or(false));
+            let slot_index = self.slots.iter().position(|slot| {
+                self.raw_device
+                    .get_fence_status(slot.fence)
+                    .unwrap_or(false)
+            });
             let slot_index = match slot_index {
                 Some(index) => index,
                 None if self.slots.len() < MAX_COPY_SLOTS => {
@@ -473,7 +476,6 @@ impl VulkanCopyContext {
                 std::slice::from_ref(&submit_info),
                 slot.fence,
             )?;
-
         }
 
         Ok(())
@@ -487,11 +489,8 @@ impl Drop for VulkanCopyContext {
             for slot in &self.slots {
                 self.raw_device.destroy_fence(slot.fence, None);
             }
-            let command_buffers: Vec<_> = self
-                .slots
-                .iter()
-                .map(|slot| slot.command_buffer)
-                .collect();
+            let command_buffers: Vec<_> =
+                self.slots.iter().map(|slot| slot.command_buffer).collect();
             self.raw_device
                 .free_command_buffers(self.command_pool, &command_buffers);
             self.raw_device
@@ -518,7 +517,12 @@ impl FrameAdapterBuilder for VulkanVideoFrameAdapter {
         // Zero-copy direct sampling is the default. Set
         // FFGPU_VULKAN_VIDEO_ZERO_COPY=0|false|off to force the GPU-copy path.
         let zero_copy_enabled = !std::env::var("FFGPU_VULKAN_VIDEO_ZERO_COPY")
-            .map(|v| matches!(v.as_str(), "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"))
+            .map(|v| {
+                matches!(
+                    v.as_str(),
+                    "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"
+                )
+            })
             .unwrap_or(false);
 
         Ok(VulkanVideoFrameAdapter {
@@ -557,14 +561,10 @@ impl VulkanVideoFrameAdapter {
         color_space: ffmpeg_next::color::Space,
     ) -> Result<&PresentationTexture> {
         let hal_device = unsafe {
-            device
-                .as_hal::<wgpu::hal::vulkan::Api>()
-                .ok_or_else(|| {
-                    log::error!(
-                        "[VulkanVideo] device.as_hal::<vulkan::Api>() returned None"
-                    );
-                    Error::UnsupportedBackend
-                })?
+            device.as_hal::<wgpu::hal::vulkan::Api>().ok_or_else(|| {
+                log::error!("[VulkanVideo] device.as_hal::<vulkan::Api>() returned None");
+                Error::UnsupportedBackend
+            })?
         };
 
         let textures = if is_multiplane {
@@ -583,17 +583,15 @@ impl VulkanVideoFrameAdapter {
             vec![tex]
         } else {
             // Separate-plane destination textures, one per plane.
-            let make_tex = |fmt: &wgpu::TextureFormat, wd: u32, hd: u32| {
-                unsafe {
-                    create_raw_vulkan_texture(
-                        device,
-                        &*hal_device,
-                        *fmt,
-                        width / wd,
-                        height / hd,
-                        "ffgpu Vulkan Video presentation (plane)",
-                    )
-                }
+            let make_tex = |fmt: &wgpu::TextureFormat, wd: u32, hd: u32| unsafe {
+                create_raw_vulkan_texture(
+                    device,
+                    &*hal_device,
+                    *fmt,
+                    width / wd,
+                    height / hd,
+                    "ffgpu Vulkan Video presentation (plane)",
+                )
             };
             match &texture_format.planes {
                 layout::PlaneLayout::PackedYUV420([y, uv]) => {
@@ -778,8 +776,7 @@ impl VulkanVideoFrameAdapter {
         let sw_format = frames_ctx.sw_format;
         let texture_format = layout::vk_format_texture_format(
             vk_format,
-            ff::AVPixelFormat::try_from(sw_format)
-                .unwrap_or(ff::AVPixelFormat::AV_PIX_FMT_NONE),
+            ff::AVPixelFormat::try_from(sw_format).unwrap_or(ff::AVPixelFormat::AV_PIX_FMT_NONE),
         )
         .ok_or(Error::UnsupportedBackend)?;
 
@@ -1000,7 +997,12 @@ impl VulkanVideoFrameAdapter {
         };
 
         let textures = if is_multiplane {
-            vec![make_external_texture(vk_frame.img[0], multiplane_format, width, height)?]
+            vec![make_external_texture(
+                vk_frame.img[0],
+                multiplane_format,
+                width,
+                height,
+            )?]
         } else {
             match &texture_format.planes {
                 layout::PlaneLayout::PackedYUV420([y, uv]) => vec![
@@ -1033,7 +1035,9 @@ impl VulkanVideoFrameAdapter {
                 ..Default::default()
             });
             match &texture_format.planes {
-                layout::PlaneLayout::PackedYUV420(_) => layout::PlaneLayout::PackedYUV420([y_view, uv_view]),
+                layout::PlaneLayout::PackedYUV420(_) => {
+                    layout::PlaneLayout::PackedYUV420([y_view, uv_view])
+                }
                 _ => return Err(Error::UnsupportedBackend),
             }
         } else {
@@ -1043,26 +1047,20 @@ impl VulkanVideoFrameAdapter {
                 .collect();
             let mut iter = views.into_iter();
             match &texture_format.planes {
-                layout::PlaneLayout::PackedYUV420(_) => {
-                    layout::PlaneLayout::PackedYUV420([
-                        iter.next().ok_or(Error::InvalidFrame)?,
-                        iter.next().ok_or(Error::InvalidFrame)?,
-                    ])
-                }
-                layout::PlaneLayout::YUV420(_) => {
-                    layout::PlaneLayout::YUV420([
-                        iter.next().ok_or(Error::InvalidFrame)?,
-                        iter.next().ok_or(Error::InvalidFrame)?,
-                        iter.next().ok_or(Error::InvalidFrame)?,
-                    ])
-                }
-                layout::PlaneLayout::YUV444(_) => {
-                    layout::PlaneLayout::YUV444([
-                        iter.next().ok_or(Error::InvalidFrame)?,
-                        iter.next().ok_or(Error::InvalidFrame)?,
-                        iter.next().ok_or(Error::InvalidFrame)?,
-                    ])
-                }
+                layout::PlaneLayout::PackedYUV420(_) => layout::PlaneLayout::PackedYUV420([
+                    iter.next().ok_or(Error::InvalidFrame)?,
+                    iter.next().ok_or(Error::InvalidFrame)?,
+                ]),
+                layout::PlaneLayout::YUV420(_) => layout::PlaneLayout::YUV420([
+                    iter.next().ok_or(Error::InvalidFrame)?,
+                    iter.next().ok_or(Error::InvalidFrame)?,
+                    iter.next().ok_or(Error::InvalidFrame)?,
+                ]),
+                layout::PlaneLayout::YUV444(_) => layout::PlaneLayout::YUV444([
+                    iter.next().ok_or(Error::InvalidFrame)?,
+                    iter.next().ok_or(Error::InvalidFrame)?,
+                    iter.next().ok_or(Error::InvalidFrame)?,
+                ]),
                 layout::PlaneLayout::RGB(_) => {
                     layout::PlaneLayout::RGB(iter.next().ok_or(Error::InvalidFrame)?)
                 }
@@ -1166,8 +1164,7 @@ impl FrameAdapter for VulkanVideoFrameAdapter {
 
         let texture_format = layout::vk_format_texture_format(
             vk_format,
-            ff::AVPixelFormat::try_from(sw_format)
-                .unwrap_or(ff::AVPixelFormat::AV_PIX_FMT_NONE),
+            ff::AVPixelFormat::try_from(sw_format).unwrap_or(ff::AVPixelFormat::AV_PIX_FMT_NONE),
         )
         .ok_or_else(|| {
             log::error!(
@@ -1219,9 +1216,7 @@ impl FrameAdapter for VulkanVideoFrameAdapter {
         // the fallback path takes over.
         for i in 0..plane_count {
             let src_qf = vk_frame.queue_family[i];
-            if src_qf != ash::vk::QUEUE_FAMILY_IGNORED
-                && src_qf != graphics_queue_family
-            {
+            if src_qf != ash::vk::QUEUE_FAMILY_IGNORED && src_qf != graphics_queue_family {
                 log::error!(
                     "[VulkanVideo] Source image queue family {} != graphics queue family {} \
                      (plane {}); cross-queue copy not yet supported",
@@ -1265,9 +1260,10 @@ impl FrameAdapter for VulkanVideoFrameAdapter {
         }
 
         // Create or reuse the persistent presentation texture.
-        let need_create = self.presentation.as_ref().map_or(true, |p| {
-            p.width != width || p.height != height
-        });
+        let need_create = self
+            .presentation
+            .as_ref()
+            .map_or(true, |p| p.width != width || p.height != height);
 
         if need_create {
             self.create_presentation(
@@ -1291,14 +1287,10 @@ impl FrameAdapter for VulkanVideoFrameAdapter {
         // encoding API (as_hal_mut) on the same command encoder.
         if self.copy_ctx.is_none() {
             let hal_queue = unsafe {
-                queue
-                    .as_hal::<wgpu::hal::vulkan::Api>()
-                    .ok_or_else(|| {
-                        log::error!(
-                            "[VulkanVideo] queue.as_hal::<vulkan::Api>() returned None"
-                        );
-                        Error::UnsupportedBackend
-                    })?
+                queue.as_hal::<wgpu::hal::vulkan::Api>().ok_or_else(|| {
+                    log::error!("[VulkanVideo] queue.as_hal::<vulkan::Api>() returned None");
+                    Error::UnsupportedBackend
+                })?
             };
             let copy_ctx = unsafe {
                 VulkanCopyContext::new(
@@ -1345,9 +1337,7 @@ impl FrameAdapter for VulkanVideoFrameAdapter {
                             let dst_image = match dst_raw {
                                 Some(img) => img,
                                 None => {
-                                    log::error!(
-                                        "[VulkanVideo] dest texture as_hal returned None"
-                                    );
+                                    log::error!("[VulkanVideo] dest texture as_hal returned None");
                                     return;
                                 }
                             };

@@ -205,9 +205,8 @@ pub unsafe fn create_ffmpeg_vulkan_device_context(
     instance_extensions: &[&'static CStr],
     device_extensions: &[&'static CStr],
 ) -> Result<NonNull<ff::AVBufferRef>> {
-    let ctx_ref: *mut ff::AVBufferRef = unsafe {
-        ff::av_hwdevice_ctx_alloc(ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN)
-    };
+    let ctx_ref: *mut ff::AVBufferRef =
+        unsafe { ff::av_hwdevice_ctx_alloc(ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN) };
     if ctx_ref.is_null() {
         log::error!("[VulkanHW] av_hwdevice_ctx_alloc returned null");
         return Err(Error::HardwareContext);
@@ -231,28 +230,25 @@ pub unsafe fn create_ffmpeg_vulkan_device_context(
 
     // Log Vulkan version info for debugging
     let instance_handle = handles.instance.handle();
-    eprintln!(
-        "[VulkanHW] Instance handle: {:?}",
-        instance_handle,
-    );
+    eprintln!("[VulkanHW] Instance handle: {:?}", instance_handle,);
     // Check if QueueSubmit2 is available (needed by FFmpeg's transfer code)
     let queue_submit2_name = b"vkQueueSubmit2\0".as_ptr() as *const c_char;
-    let queue_submit2_ptr = unsafe {
-        (handles.get_proc_addr)(instance_handle, queue_submit2_name)
-    };
-    eprintln!(
-        "[VulkanHW] vkQueueSubmit2 ptr: {:?}",
-        queue_submit2_ptr,
-    );
+    let queue_submit2_ptr = unsafe { (handles.get_proc_addr)(instance_handle, queue_submit2_name) };
+    eprintln!("[VulkanHW] vkQueueSubmit2 ptr: {:?}", queue_submit2_ptr,);
     let props = unsafe {
-        handles.instance.get_physical_device_properties(handles.physical_device)
+        handles
+            .instance
+            .get_physical_device_properties(handles.physical_device)
     };
     eprintln!(
         "[VulkanHW] Device API version: {}.{}.{}, driver: {}",
         ash::vk::api_version_major(props.api_version),
         ash::vk::api_version_minor(props.api_version),
         ash::vk::api_version_patch(props.api_version),
-        props.device_name_as_c_str().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+        props
+            .device_name_as_c_str()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
     );
 
     // Set get_proc_addr from the Vulkan loader. This is CRITICAL:
@@ -266,17 +262,25 @@ pub unsafe fn create_ffmpeg_vulkan_device_context(
     // Query and store the physical device features we enabled.
     let mut features = ash::vk::PhysicalDeviceFeatures2::default();
     unsafe {
-        handles.instance.get_physical_device_features2(handles.physical_device, &mut features)
+        handles
+            .instance
+            .get_physical_device_features2(handles.physical_device, &mut features)
     };
     unsafe { (*vulkan_ctx).device_features = features };
 
     // Leak extension name pointer arrays. They are small and live as long as
     // the hwdevice context.
-    eprintln!("[VulkanHW] Instance extensions ({}):", instance_extensions.len());
+    eprintln!(
+        "[VulkanHW] Instance extensions ({}):",
+        instance_extensions.len()
+    );
     for ext in instance_extensions {
         eprintln!("[VulkanHW]   inst ext: {}", ext.to_string_lossy());
     }
-    eprintln!("[VulkanHW] Device extensions ({}):", device_extensions.len());
+    eprintln!(
+        "[VulkanHW] Device extensions ({}):",
+        device_extensions.len()
+    );
     for ext in device_extensions {
         eprintln!("[VulkanHW]   dev ext: {}", ext.to_string_lossy());
     }
@@ -315,8 +319,7 @@ pub unsafe fn create_ffmpeg_vulkan_device_context(
         let decode_qf = AVVulkanDeviceQueueFamily {
             idx: handles.video_queue_family_index as c_int,
             num: 1,
-            flags: ash::vk::QueueFlags::VIDEO_DECODE_KHR
-                | ash::vk::QueueFlags::TRANSFER,
+            flags: ash::vk::QueueFlags::VIDEO_DECODE_KHR | ash::vk::QueueFlags::TRANSFER,
             video_caps: ash::vk::VideoCodecOperationFlagsKHR::empty(),
         };
         unsafe {
@@ -359,7 +362,10 @@ pub unsafe fn create_ffmpeg_vulkan_device_context(
     unsafe { (*vulkan_ctx).lock_queue = Some(noop_lock_queue) };
     unsafe { (*vulkan_ctx).unlock_queue = Some(noop_lock_queue) };
 
-    log::info!("[VulkanHW] Calling av_hwdevice_ctx_init (struct size: {})", std::mem::size_of::<AVVulkanDeviceContext>());
+    log::info!(
+        "[VulkanHW] Calling av_hwdevice_ctx_init (struct size: {})",
+        std::mem::size_of::<AVVulkanDeviceContext>()
+    );
     let init_ret = unsafe { ff::av_hwdevice_ctx_init(ctx_ref.as_ptr()) };
     if init_ret != 0 {
         log::error!("[VulkanHW] av_hwdevice_ctx_init failed: {}", init_ret);
@@ -381,26 +387,86 @@ mod tests {
         eprintln!("=== AVVulkanDeviceContext layout ===");
         eprintln!("  size: {}", std::mem::size_of::<AVVulkanDeviceContext>());
         eprintln!("  align: {}", std::mem::align_of::<AVVulkanDeviceContext>());
-        eprintln!("  offset alloc: {}", std::mem::offset_of!(AVVulkanDeviceContext, alloc));
-        eprintln!("  offset get_proc_addr: {}", std::mem::offset_of!(AVVulkanDeviceContext, get_proc_addr));
-        eprintln!("  offset inst: {}", std::mem::offset_of!(AVVulkanDeviceContext, inst));
-        eprintln!("  offset phys_dev: {}", std::mem::offset_of!(AVVulkanDeviceContext, phys_dev));
-        eprintln!("  offset act_dev: {}", std::mem::offset_of!(AVVulkanDeviceContext, act_dev));
-        eprintln!("  offset device_features: {}", std::mem::offset_of!(AVVulkanDeviceContext, device_features));
-        eprintln!("  offset enabled_inst_extensions: {}", std::mem::offset_of!(AVVulkanDeviceContext, enabled_inst_extensions));
-        eprintln!("  offset nb_enabled_inst_extensions: {}", std::mem::offset_of!(AVVulkanDeviceContext, nb_enabled_inst_extensions));
-        eprintln!("  offset enabled_dev_extensions: {}", std::mem::offset_of!(AVVulkanDeviceContext, enabled_dev_extensions));
-        eprintln!("  offset nb_enabled_dev_extensions: {}", std::mem::offset_of!(AVVulkanDeviceContext, nb_enabled_dev_extensions));
-        eprintln!("  offset queue_family_index: {}", std::mem::offset_of!(AVVulkanDeviceContext, queue_family_index));
-        eprintln!("  offset nb_decode_queues: {}", std::mem::offset_of!(AVVulkanDeviceContext, nb_decode_queues));
-        eprintln!("  offset lock_queue: {}", std::mem::offset_of!(AVVulkanDeviceContext, lock_queue));
-        eprintln!("  offset unlock_queue: {}", std::mem::offset_of!(AVVulkanDeviceContext, unlock_queue));
-        eprintln!("  offset qf: {}", std::mem::offset_of!(AVVulkanDeviceContext, qf));
-        eprintln!("  offset nb_qf: {}", std::mem::offset_of!(AVVulkanDeviceContext, nb_qf));
-        eprintln!("  PhysicalDeviceFeatures size: {}", std::mem::size_of::<ash::vk::PhysicalDeviceFeatures>());
-        eprintln!("  PhysicalDeviceFeatures2 size: {}", std::mem::size_of::<ash::vk::PhysicalDeviceFeatures2<'static>>());
-        eprintln!("  AVVulkanDeviceQueueFamily size: {}", std::mem::size_of::<AVVulkanDeviceQueueFamily>());
-        eprintln!("  AVVulkanFramesContext size: {}", std::mem::size_of::<AVVulkanFramesContext>());
+        eprintln!(
+            "  offset alloc: {}",
+            std::mem::offset_of!(AVVulkanDeviceContext, alloc)
+        );
+        eprintln!(
+            "  offset get_proc_addr: {}",
+            std::mem::offset_of!(AVVulkanDeviceContext, get_proc_addr)
+        );
+        eprintln!(
+            "  offset inst: {}",
+            std::mem::offset_of!(AVVulkanDeviceContext, inst)
+        );
+        eprintln!(
+            "  offset phys_dev: {}",
+            std::mem::offset_of!(AVVulkanDeviceContext, phys_dev)
+        );
+        eprintln!(
+            "  offset act_dev: {}",
+            std::mem::offset_of!(AVVulkanDeviceContext, act_dev)
+        );
+        eprintln!(
+            "  offset device_features: {}",
+            std::mem::offset_of!(AVVulkanDeviceContext, device_features)
+        );
+        eprintln!(
+            "  offset enabled_inst_extensions: {}",
+            std::mem::offset_of!(AVVulkanDeviceContext, enabled_inst_extensions)
+        );
+        eprintln!(
+            "  offset nb_enabled_inst_extensions: {}",
+            std::mem::offset_of!(AVVulkanDeviceContext, nb_enabled_inst_extensions)
+        );
+        eprintln!(
+            "  offset enabled_dev_extensions: {}",
+            std::mem::offset_of!(AVVulkanDeviceContext, enabled_dev_extensions)
+        );
+        eprintln!(
+            "  offset nb_enabled_dev_extensions: {}",
+            std::mem::offset_of!(AVVulkanDeviceContext, nb_enabled_dev_extensions)
+        );
+        eprintln!(
+            "  offset queue_family_index: {}",
+            std::mem::offset_of!(AVVulkanDeviceContext, queue_family_index)
+        );
+        eprintln!(
+            "  offset nb_decode_queues: {}",
+            std::mem::offset_of!(AVVulkanDeviceContext, nb_decode_queues)
+        );
+        eprintln!(
+            "  offset lock_queue: {}",
+            std::mem::offset_of!(AVVulkanDeviceContext, lock_queue)
+        );
+        eprintln!(
+            "  offset unlock_queue: {}",
+            std::mem::offset_of!(AVVulkanDeviceContext, unlock_queue)
+        );
+        eprintln!(
+            "  offset qf: {}",
+            std::mem::offset_of!(AVVulkanDeviceContext, qf)
+        );
+        eprintln!(
+            "  offset nb_qf: {}",
+            std::mem::offset_of!(AVVulkanDeviceContext, nb_qf)
+        );
+        eprintln!(
+            "  PhysicalDeviceFeatures size: {}",
+            std::mem::size_of::<ash::vk::PhysicalDeviceFeatures>()
+        );
+        eprintln!(
+            "  PhysicalDeviceFeatures2 size: {}",
+            std::mem::size_of::<ash::vk::PhysicalDeviceFeatures2<'static>>()
+        );
+        eprintln!(
+            "  AVVulkanDeviceQueueFamily size: {}",
+            std::mem::size_of::<AVVulkanDeviceQueueFamily>()
+        );
+        eprintln!(
+            "  AVVulkanFramesContext size: {}",
+            std::mem::size_of::<AVVulkanFramesContext>()
+        );
         eprintln!("  AVVkFrame size: {}", std::mem::size_of::<AVVkFrame>());
     }
 
@@ -423,4 +489,3 @@ mod tests {
         unsafe { ff::av_free(frame as *mut c_void) };
     }
 }
-

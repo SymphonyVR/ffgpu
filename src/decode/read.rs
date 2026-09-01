@@ -59,9 +59,8 @@ impl Input {
         let alive = state.alive.clone();
         // ffmpeg-next's interrupt callback: returns `true` to abort,
         // `false` to continue. We abort when alive is false.
-        let format_ctx = ffn::format::input_with_interrupt(path, move || {
-            !alive.load(Ordering::Relaxed)
-        })?;
+        let format_ctx =
+            ffn::format::input_with_interrupt(path, move || !alive.load(Ordering::Relaxed))?;
 
         let metadata = metadata_from_format(&format_ctx);
 
@@ -159,7 +158,12 @@ mod tests {
 
 #[derive(Debug)]
 pub(crate) enum ReadMessage {
-    SeekStream { ts: i64, mode: SeekMode, forward: bool },
+    SeekStream {
+        ts: i64,
+        mode: SeekMode,
+        #[allow(dead_code)] // direction flag reserved for backward-seek support
+        forward: bool,
+    },
 }
 
 pub(crate) struct ReadThread {
@@ -177,11 +181,92 @@ impl ReadThread {
         }
     }
 
+    /// Drain all pending seek commands before the caller observes
+    /// `play_state`. The old inline drain ran after the play-state snapshot,
+    /// so a seek could be applied with the pre-seek Playing state; that left
+    /// the video decoder running when the engine expected a paused/stepping
+    /// accurate-seek and produced the random "audio plays, video frozen"
+    /// resume failure.
+    fn drain_messages(&mut self) {
+        let video_stream = self.state.video_stream.load().clone();
+        let audio_stream = self.state.audio_stream.load().clone();
+        while let Ok(message) = self.messages.try_recv() {
+            let ReadMessage::SeekStream {
+                ts,
+                mode,
+                forward: _,
+            } = message;
+
+            // Always seek BACKWARD (like ffplay). A "forward"
+            // seek (seek flags = 0, next keyframe after target)
+            // only helps when the container has a real index
+            // (mp4/mkv Cues). For Cue-less WebM there is no future
+            // index yet, so avformat_seek_file cannot advance: the
+            // demuxer stays near the start and the audio decoder
+            // must walk the whole clip discarding frames — the
+            // "no audio after seek" stall. BACKWARD lands on the
+            // previous keyframe (always seekable) and the decode
+            // walk with SkipToTimestamp handles the rest.
+            let seek_flags = ff::AVSEEK_FLAG_BACKWARD;
+            if let Err(error) = {
+                let err = unsafe {
+                    ff::avformat_seek_file(
+                        self.input.format_ctx.as_mut_ptr(),
+                        -1,
+                        i64::MIN,
+                        ts,
+                        i64::MAX,
+                        seek_flags,
+                    )
+                };
+
+                (err == 0).then_some(()).ok_or(ffn::Error::from(err))
+            } {
+                log::error!("failed to seek stream: {}", error);
+            } else {
+                self.state.is_eof.store(false, Ordering::SeqCst);
+
+                video_stream.packets.flush();
+                video_stream.packets.set_loop_index(0);
+
+                audio_stream.packets.flush();
+                audio_stream.packets.set_loop_index(0);
+                self.state.loop_index.store(0, Ordering::SeqCst);
+
+                match mode {
+                    SeekMode::Accurate => {
+                        let _ = video_stream
+                            .messages
+                            .send(video::Message::SkipToTimestamp(ts));
+                        let _ = audio_stream
+                            .messages
+                            .send(audio::Message::SkipToTimestamp(ts));
+                    }
+                    _ => {}
+                }
+
+                if self.state.play_state() == PlayState::Paused {
+                    self.state
+                        .play_state
+                        .store(PlayState::Step as _, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
     fn run_thread(&mut self) {
         const MAX_QUEUE_SIZE: usize = 15 * 1024 * 1024;
 
         while self.state.alive.load(Ordering::Relaxed) {
+            // Drain seek commands BEFORE taking the play_state snapshot that
+            // the command handlers read. A seek sent while `play_state` was
+            // already Playing can otherwise be processed with the stale
+            // Playing value, so the post-seek decoder state stays Playing and
+            // the exact-frame resume protocol is never armed.
+            self.drain_messages();
+
             let play_state = self.state.play_state();
+
             // TODO: for network streams
             /*if self.was_paused != paused {
                 self.was_paused = paused;
@@ -198,68 +283,7 @@ impl ReadThread {
             let video_stream = self.state.video_stream.load().clone();
             let audio_stream = self.state.audio_stream.load().clone();
 
-            while let Ok(message) = self.messages.try_recv() {
-                match message {
-                    ReadMessage::SeekStream { ts, mode, forward: _ } => {
-                        // Always seek BACKWARD (like ffplay). A "forward"
-                        // seek (seek flags = 0, next keyframe after target)
-                        // only helps when the container has a real index
-                        // (mp4/mkv Cues). For Cue-less WebM there is no future
-                        // index yet, so avformat_seek_file cannot advance: the
-                        // demuxer stays near the start and the audio decoder
-                        // must walk the whole clip discarding frames — the
-                        // "no audio after seek" stall. BACKWARD lands on the
-                        // previous keyframe (always seekable) and the decode
-                        // walk with SkipToTimestamp handles the rest.
-                        let seek_flags = ff::AVSEEK_FLAG_BACKWARD;
-                        if let Err(error) = {
-                            let err = unsafe {
-                                ff::avformat_seek_file(
-                                    self.input.format_ctx.as_mut_ptr(),
-                                    -1,
-                                    i64::MIN,
-                                    ts,
-                                    i64::MAX,
-                                    seek_flags,
-                                )
-                            };
-
-                            (err == 0).then_some(()).ok_or(ffn::Error::from(err))
-                        } {
-                            log::error!("failed to seek stream: {}", error);
-                        } else {
-                            self.state.is_eof.store(false, Ordering::SeqCst);
-
-video_stream.packets.flush();
-                            video_stream.packets.set_loop_index(0);
-
-                            audio_stream.packets.flush();
-                            audio_stream.packets.set_loop_index(0);
-                            self.state.loop_index.store(0, Ordering::SeqCst);
-
-                            match mode {
-                                SeekMode::Accurate => {
-                                    let _ = video_stream
-                                        .messages
-                                        .send(video::Message::SkipToTimestamp(ts));
-                                    let _ = audio_stream
-                                        .messages
-                                        .send(audio::Message::SkipToTimestamp(ts));
-                                }
-                                _ => {}
-                            }
-
-                            if play_state == PlayState::Paused {
-                                self.state
-                                    .play_state
-                                    .store(PlayState::Step as _, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
-            }
-
-// Backpressure gate: sleep once BOTH the video AND audio
+            // Backpressure gate: sleep once BOTH the video AND audio
             // pipelines are primed (count-based, so short clips throttle too).
             // A no-audio stream has `metadata.index == usize::MAX` and is
             // treated as always-primed — otherwise it would gate forever and
@@ -317,7 +341,8 @@ video_stream.packets.flush();
                             } == 0;
 
                             if rewind {
-                                let next_loop = self.state.loop_index.fetch_add(1, Ordering::SeqCst) + 1;
+                                let next_loop =
+                                    self.state.loop_index.fetch_add(1, Ordering::SeqCst) + 1;
                                 video_stream.packets.set_loop_index(next_loop);
                                 audio_stream.packets.set_loop_index(next_loop);
                                 self.state.loop_events.fetch_add(1, Ordering::SeqCst);
@@ -361,8 +386,7 @@ video_stream.packets.flush();
     }
 
     pub fn run(mut self) -> JoinHandle<()> {
-        let guard =
-            crate::decode::ThreadGuard::new(self.state.thread_count.clone());
+        let guard = crate::decode::ThreadGuard::new(self.state.thread_count.clone());
         std::thread::spawn(move || {
             let _guard = guard;
             self.run_thread();

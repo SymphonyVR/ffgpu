@@ -8,11 +8,11 @@ use crate::{
 use ffmpeg_next::{self as ffn, sys as ff};
 use std::{ffi::c_void, mem::ManuallyDrop, ptr::NonNull};
 use windows::{
+    core::Interface,
     Win32::{
         Foundation::HANDLE,
         Graphics::{Direct3D11 as D3D11, Direct3D12 as D3D12, Dxgi},
     },
-    core::Interface,
 };
 
 // see libavutil/hwcontext_d3d11va.h
@@ -59,15 +59,16 @@ fn get_dxgi_layout(
 }
 
 struct ImportedTexture {
+    // Rust drops fields in declaration order. Release every wgpu/DX12 consumer
+    // before the D3D11 producer that owns the shared allocation.
+    bg0: wgpu::BindGroup,
+    texture: wgpu::Texture,
     // TODO(jazzfool): FFmpeg recently added the ability to specify SHARED misc flag (not yet released as of 02/26)
     // by passing "SHARED" in an AVDictionary to hwcontext_d3d11va
     // which means we could skip copying to another D3D11 with the SHARED flag and directly export the FFmpeg-created texture
     shared_texture: D3D11::ID3D11Texture2D,
-    /// The wgpu texture wrapped from `shared_texture` (NV12 multi-planar). Stored
-    /// so the engine can build its own YUV bind group for direct sampling.
-    texture: wgpu::Texture,
     identity: layout::FrameDescriptor<()>,
-    bg0: wgpu::BindGroup,
+    dx12_interop: bool,
 }
 
 impl ImportedTexture {
@@ -111,6 +112,7 @@ impl ImportedTexture {
                 texture,
                 identity: layout.as_identity(),
                 bg0,
+                dx12_interop: true,
             })
         }
     }
@@ -155,6 +157,7 @@ impl ImportedTexture {
                 texture,
                 identity: layout.as_identity(),
                 bg0,
+                dx12_interop: false,
             })
         }
     }
@@ -321,9 +324,71 @@ fn acquire_ffmpeg_lock(
 }
 
 pub struct D3D11VAFrameAdapter {
-    d3d11_ctx: *mut AVD3D11VADeviceContext,
-    d3d11_device: D3D11::ID3D11Device,
+    // Imported resources must die before the D3D11 device they came from.
     imported_texture: Option<ImportedTexture>,
+    d3d11_device: Option<D3D11::ID3D11Device>,
+    d3d11_ctx: *mut AVD3D11VADeviceContext,
+}
+
+impl Drop for D3D11VAFrameAdapter {
+    fn drop(&mut self) {
+        let needs_idle_wait = self
+            .imported_texture
+            .as_ref()
+            .is_some_and(|texture| texture.dx12_interop);
+        if needs_idle_wait && !self.d3d11_device.as_ref().is_some_and(wait_for_d3d11_idle) {
+            // Releasing a shared allocation while D3D11 still owns queued work
+            // is unsafe. A shutdown leak is preferable to a native driver crash.
+            std::mem::forget(self.imported_texture.take());
+            std::mem::forget(self.d3d11_device.take());
+            return;
+        }
+
+        // Keep this explicit: DX12 consumers die only after both APIs are idle,
+        // then the D3D11 producer and device are released in ownership order.
+        drop(self.imported_texture.take());
+        drop(self.d3d11_device.take());
+    }
+}
+
+fn wait_for_d3d11_idle(device: &D3D11::ID3D11Device) -> bool {
+    unsafe {
+        let Ok(context) = device.GetImmediateContext() else {
+            return false;
+        };
+        let mut query = None;
+        let desc = D3D11::D3D11_QUERY_DESC {
+            Query: D3D11::D3D11_QUERY_EVENT,
+            MiscFlags: 0,
+        };
+        if device.CreateQuery(&desc, Some(&mut query)).is_err() {
+            return false;
+        }
+        let Some(query) = query else {
+            return false;
+        };
+
+        context.End(&query);
+        context.Flush();
+        loop {
+            // windows-rs maps both S_OK and S_FALSE to Ok(()), so use the raw
+            // HRESULT to distinguish completion from "not ready yet".
+            let status = (D3D11::ID3D11DeviceContext::vtable(&context).GetData)(
+                D3D11::ID3D11DeviceContext::as_raw(&context),
+                D3D11::ID3D11Query::as_raw(&query),
+                std::ptr::null_mut(),
+                0,
+                0,
+            );
+            if status.0 == 0 {
+                return true;
+            }
+            if status.0 < 0 {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+    }
 }
 
 impl FrameAdapterBuilder for D3D11VAFrameAdapter {
@@ -356,16 +421,18 @@ impl FrameAdapterBuilder for D3D11VAFrameAdapter {
             // alive by accident). This QI'd ref keeps the D3D11 device alive
             // for the adapter and its Drop (Release) balances it, so the
             // unref ordering never matters.
-            let d3d11_device: D3D11::ID3D11Device =
-                core::mem::transmute((*d3d11_ctx).device);
-            let d3d11_device = d3d11_device
+            // FFmpeg owns this raw COM reference. Borrow it without Release;
+            // QueryInterface below creates the adapter's independently owned ref.
+            let borrowed_device: ManuallyDrop<D3D11::ID3D11Device> =
+                ManuallyDrop::new(core::mem::transmute((*d3d11_ctx).device));
+            let d3d11_device = borrowed_device
                 .cast::<D3D11::ID3D11Device>()
                 .map_err(|_| Error::TextureShare)?;
 
             Ok(D3D11VAFrameAdapter {
-                d3d11_ctx,
-                d3d11_device,
                 imported_texture: None,
+                d3d11_device: Some(d3d11_device),
+                d3d11_ctx,
             })
         }
     }
@@ -413,18 +480,22 @@ impl FrameAdapter for D3D11VAFrameAdapter {
                 imported_texture
             } else {
                 let color_space = frame.colorspace.into();
+                let d3d11_device = self
+                    .d3d11_device
+                    .as_ref()
+                    .expect("D3D11 device is alive while the frame adapter is active");
                 let imported_texture = match adapter.get_info().backend {
                     wgpu::Backend::Vulkan => ImportedTexture::new_vulkan(
                         device,
                         pipeline_cache,
-                        &self.d3d11_device,
+                        d3d11_device,
                         &desc,
                         color_space,
                     )?,
                     wgpu::Backend::Dx12 => ImportedTexture::new_d3d12(
                         device,
                         pipeline_cache,
-                        &self.d3d11_device,
+                        d3d11_device,
                         &desc,
                         color_space,
                     )?,
@@ -449,6 +520,8 @@ impl FrameAdapter for D3D11VAFrameAdapter {
                     .map_err(|_| Error::Unknown)?;
 
             self.d3d11_device
+                .as_ref()
+                .expect("D3D11 device is alive while the frame adapter is active")
                 .GetImmediateContext()
                 .unwrap()
                 .CopySubresourceRegion(
@@ -489,16 +562,14 @@ impl FrameAdapter for D3D11VAFrameAdapter {
     fn plane_views(&self) -> Option<Vec<wgpu::TextureView>> {
         self.imported_texture.as_ref().map(|t| {
             vec![
-                t.texture
-                    .create_view(&wgpu::TextureViewDescriptor {
-                        aspect: wgpu::TextureAspect::Plane0,
-                        ..Default::default()
-                    }),
-                t.texture
-                    .create_view(&wgpu::TextureViewDescriptor {
-                        aspect: wgpu::TextureAspect::Plane1,
-                        ..Default::default()
-                    }),
+                t.texture.create_view(&wgpu::TextureViewDescriptor {
+                    aspect: wgpu::TextureAspect::Plane0,
+                    ..Default::default()
+                }),
+                t.texture.create_view(&wgpu::TextureViewDescriptor {
+                    aspect: wgpu::TextureAspect::Plane1,
+                    ..Default::default()
+                }),
             ]
         })
     }
