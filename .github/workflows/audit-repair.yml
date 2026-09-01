@@ -13,6 +13,9 @@ jobs:
   repair:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
+    env:
+      PKG_CONFIG_PATH: /tmp/ffmpeg-8.1/lib/pkgconfig
+      LD_LIBRARY_PATH: /tmp/ffmpeg-8.1/lib
     steps:
       - uses: actions/checkout@v4
         with:
@@ -22,12 +25,27 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             pkg-config clang libclang-dev libdbus-1-dev \
-            libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev libavfilter-dev libavdevice-dev \
             libasound2-dev libudev-dev libpulse-dev libwayland-dev libxkbcommon-dev
+      - name: Build FFmpeg 8.1 for ABI-accurate validation
+        run: |
+          git clone --depth 1 --branch n8.1 https://github.com/FFmpeg/FFmpeg.git /tmp/ffmpeg-src
+          cd /tmp/ffmpeg-src
+          ./configure \
+            --prefix=/tmp/ffmpeg-8.1 \
+            --disable-programs \
+            --disable-doc \
+            --disable-debug \
+            --disable-static \
+            --enable-shared \
+            --disable-autodetect
+          make -j2
+          make install
+          pkg-config --modversion libavutil
       - name: Apply audited repairs
         run: |
           python3 .repair/prep.py
           python3 .repair/repair.py
+          python3 .repair/preflight.py
       - name: Format
         run: cargo fmt --all
       - name: Diff sanity
