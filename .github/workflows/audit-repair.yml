@@ -4,7 +4,7 @@ on:
   push:
     branches: [audit-repair]
     paths:
-      - '.repair/repair.py'
+      - '.repair/**'
 
 permissions:
   contents: write
