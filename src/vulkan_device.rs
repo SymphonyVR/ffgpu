@@ -33,10 +33,8 @@ const VIDEO_DECODE_EXTENSIONS: &[&std::ffi::CStr] = &[
 /// This list mirrors the `optional_device_exts` array in FFmpeg's
 /// `libavutil/hwcontext_vulkan.c`.
 const OPTIONAL_FFMPEG_EXTENSIONS: &[&std::ffi::CStr] = &[
-    // Video maintenance extensions — needed for video decode
     c"VK_KHR_video_maintenance1",
     c"VK_KHR_video_maintenance2",
-    // General extensions FFmpeg uses for its Vulkan backend
     c"VK_KHR_portability_subset",
     c"VK_KHR_push_descriptor",
     c"VK_EXT_descriptor_buffer",
@@ -47,7 +45,6 @@ const OPTIONAL_FFMPEG_EXTENSIONS: &[&std::ffi::CStr] = &[
     c"VK_KHR_shader_expect_assume",
     c"VK_EXT_host_image_copy",
     c"VK_KHR_shader_relaxed_extended_instruction",
-    // External memory/semaphore extensions for interop
     c"VK_KHR_external_memory_fd",
     c"VK_KHR_external_semaphore_fd",
     c"VK_EXT_external_memory_host",
@@ -56,13 +53,6 @@ const OPTIONAL_FFMPEG_EXTENSIONS: &[&std::ffi::CStr] = &[
     c"VK_EXT_physical_device_drm",
 ];
 
-/// Query the physical device for its supported extensions and return the
-/// subset of `VIDEO_DECODE_EXTENSIONS` + `OPTIONAL_FFMPEG_EXTENSIONS` that are
-/// actually available.
-///
-/// This is critical: requesting an extension the device doesn't support causes
-/// `vkCreateDevice` to return `ERROR_EXTENSION_NOT_PRESENT`, which wgpu-hal
-/// turns into a panic (not a `Result::Err`).
 fn supported_video_decode_extensions(
     raw_instance: &ash::Instance,
     physical_device: ash::vk::PhysicalDevice,
@@ -79,7 +69,6 @@ fn supported_video_decode_extensions(
             }
         };
 
-    // Build a set of supported extension name strings for fast lookup.
     let supported_names: std::collections::HashSet<String> = supported
         .iter()
         .filter_map(|p| {
@@ -89,7 +78,6 @@ fn supported_video_decode_extensions(
         })
         .collect();
 
-    // Combine video decode extensions with optional FFmpeg extensions.
     let all_requested: Vec<&'static std::ffi::CStr> = VIDEO_DECODE_EXTENSIONS
         .iter()
         .chain(OPTIONAL_FFMPEG_EXTENSIONS.iter())
@@ -128,17 +116,12 @@ fn supported_video_decode_extensions(
     result
 }
 
-/// Result of creating a Vulkan video device.
 pub struct VulkanVideoDevice {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub video_queue_family_index: u32,
 }
 
-/// Return the full list of device extensions that should be enabled when
-/// creating a shared Vulkan device for video decoding. This includes the
-/// extensions wgpu requires plus the Vulkan Video decode extensions that are
-/// actually supported by the physical device.
 pub fn enabled_device_extensions(adapter: &wgpu::Adapter) -> Vec<&'static std::ffi::CStr> {
     let hal_adapter = unsafe { adapter.as_hal::<wgpu::hal::vulkan::Api>() };
 
@@ -154,10 +137,11 @@ pub fn enabled_device_extensions(adapter: &wgpu::Adapter) -> Vec<&'static std::f
     }
 
     extensions.extend(video_exts);
+    extensions.sort_unstable_by(|a, b| a.to_bytes().cmp(b.to_bytes()));
+    extensions.dedup_by(|a, b| a.to_bytes() == b.to_bytes());
     extensions
 }
 
-/// Return the list of instance extensions enabled on the wgpu Vulkan instance.
 pub fn enabled_instance_extensions(instance: &wgpu::Instance) -> Vec<&'static std::ffi::CStr> {
     let hal_instance = unsafe { instance.as_hal::<wgpu::hal::vulkan::Api>() };
     hal_instance
@@ -169,34 +153,18 @@ pub fn enabled_instance_extensions(instance: &wgpu::Instance) -> Vec<&'static st
 }
 
 /// Create a wgpu Device with Vulkan Video decode extensions enabled.
-///
-/// This function:
-/// 1. Gets the hal adapter for Vulkan
-/// 2. Queries queue families for video decode support
-/// 3. Uses wgpu-hal's callback mechanism to:
-///    a. Add video decode extensions to the enabled extension list
-///    b. Add a video decode queue if it's on a different queue family
-/// 4. Creates the device with the custom configuration
-/// 5. Wraps it as a wgpu Device
-///
-/// # Returns
-/// - `Ok(VulkanVideoDevice)` if successful
-/// - `Err(Error::UnsupportedBackend)` if not on Vulkan backend
-/// - `Err(Error::HardwareContext)` if video decode queue not found or device creation fails
 pub fn create_vulkan_device_for_video(
     instance: &wgpu::Instance,
     adapter: &wgpu::Adapter,
     required_features: wgpu::Features,
     required_limits: &wgpu::Limits,
 ) -> Result<VulkanVideoDevice> {
-    // Get the hal adapter for Vulkan
     let hal_adapter = unsafe {
         adapter
             .as_hal::<wgpu::hal::vulkan::Api>()
             .ok_or(Error::UnsupportedBackend)?
     };
 
-    // Get instance and physical device for queue family query
     let instance_hal = unsafe {
         instance
             .as_hal::<wgpu::hal::vulkan::Api>()
@@ -207,92 +175,75 @@ pub fn create_vulkan_device_for_video(
     let raw_instance = instance_shared.raw_instance();
     let physical_device = hal_adapter.raw_physical_device();
 
-    // Query queue families to find one with video decode support
     let queue_families =
         unsafe { raw_instance.get_physical_device_queue_family_properties(physical_device) };
 
-    let mut video_queue_family_index = None;
-    let mut graphics_queue_family_index = None;
-
-    // First pass: prefer a queue family that has both graphics and video decode
-    for (i, props) in queue_families.iter().enumerate() {
-        let i = i as u32;
-        if props.queue_flags.contains(ash::vk::QueueFlags::GRAPHICS)
-            && props
+    // Prefer a video-decode family that does not also carry graphics work.
+    // Keeping decode off the renderer queue avoids unnecessary cross-library
+    // VkQueue contention between FFmpeg and wgpu. If the device exposes only
+    // a combined family, retain it as the compatibility fallback.
+    let dedicated_video_qfi = queue_families
+        .iter()
+        .enumerate()
+        .find(|(_, props)| {
+            props
                 .queue_flags
                 .contains(ash::vk::QueueFlags::VIDEO_DECODE_KHR)
-        {
-            video_queue_family_index = Some(i);
-            graphics_queue_family_index = Some(i);
-            break;
-        }
-        if props.queue_flags.contains(ash::vk::QueueFlags::GRAPHICS) {
-            graphics_queue_family_index = Some(i);
-        }
-    }
+                && !props.queue_flags.contains(ash::vk::QueueFlags::GRAPHICS)
+        })
+        .map(|(i, _)| i as u32);
 
-    // If no combined queue, look for a separate video decode queue
-    if video_queue_family_index.is_none() {
-        for (i, props) in queue_families.iter().enumerate() {
-            let i = i as u32;
-            if props
-                .queue_flags
-                .contains(ash::vk::QueueFlags::VIDEO_DECODE_KHR)
-            {
-                video_queue_family_index = Some(i);
-                break;
-            }
-        }
-    }
-
-    let video_queue_family_index = video_queue_family_index.ok_or_else(|| {
-        log::error!("[VulkanVideo] No queue family with VIDEO_DECODE_KHR found");
-        Error::HardwareContext
-    })?;
-
-    let graphics_queue_family_index = graphics_queue_family_index.ok_or_else(|| {
-        log::error!("[VulkanVideo] No queue family with GRAPHICS found");
-        Error::HardwareContext
-    })?;
+    let video_queue_family_index = dedicated_video_qfi
+        .or_else(|| {
+            queue_families
+                .iter()
+                .enumerate()
+                .find(|(_, props)| {
+                    props
+                        .queue_flags
+                        .contains(ash::vk::QueueFlags::VIDEO_DECODE_KHR)
+                })
+                .map(|(i, _)| i as u32)
+        })
+        .ok_or_else(|| {
+            log::error!("[VulkanVideo] No queue family with VIDEO_DECODE_KHR found");
+            Error::HardwareContext
+        })?;
 
     log::info!(
-        "[VulkanVideo] Graphics queue family: {}, Video decode queue family: {}",
-        graphics_queue_family_index,
-        video_queue_family_index
+        "[VulkanVideo] Selected video decode queue family: {}{}",
+        video_queue_family_index,
+        if dedicated_video_qfi.is_some() {
+            " (dedicated)"
+        } else {
+            " (combined fallback)"
+        }
     );
 
-    // Use wgpu-hal's callback mechanism to customize device creation.
-    //
-    // The callback receives `args.extensions` which is the Vec<&'static CStr>
-    // that wgpu-hal will actually pass to vkCreateDevice. We must add our
-    // video decode extensions THERE, not to a separate Vec.
-    //
-    // Similarly, `args.queue_create_infos` is the Vec that gets passed to
-    // vkCreateDevice, so we add the video decode queue there if it's on a
-    // different queue family than the graphics queue.
-    // Query which video decode extensions are actually supported by this
-    // physical device. Requesting unsupported extensions causes vkCreateDevice
-    // to return ERROR_EXTENSION_NOT_PRESENT, which wgpu-hal turns into a panic.
     let supported_video_exts = supported_video_decode_extensions(raw_instance, physical_device);
-
     let video_qfi = video_queue_family_index;
-    let graphics_qfi = graphics_queue_family_index;
-
-    // Static queue priority - must be 'static to avoid dangling reference
-    // after the callback returns (the DeviceQueueCreateInfo in the Vec is used
-    // by open_with_callback after the callback completes).
     const QUEUE_PRIORITY: &[f32] = &[1.0];
 
     let callback = Box::new(move |args: wgpu::hal::vulkan::CreateDeviceCallbackArgs| {
-        // Add only the video decode extensions that the physical device supports.
         for ext in &supported_video_exts {
-            log::debug!("[VulkanVideo] Enabling extension: {:?}", ext);
-            args.extensions.push(*ext);
+            if !args
+                .extensions
+                .iter()
+                .any(|enabled| enabled.to_bytes() == ext.to_bytes())
+            {
+                log::debug!("[VulkanVideo] Enabling extension: {:?}", ext);
+                args.extensions.push(*ext);
+            }
         }
 
-        // Add video decode queue if it's on a different queue family than
-        // the graphics queue that wgpu-hal already added.
-        if video_qfi != graphics_qfi {
+        // Use wgpu-hal's actual VkDevice queue-create infos as the authority.
+        // Do not independently guess which graphics family wgpu selected.
+        let video_family_already_requested = args
+            .queue_create_infos
+            .iter()
+            .any(|info| info.queue_family_index == video_qfi);
+
+        if !video_family_already_requested {
             let video_queue_info = ash::vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(video_qfi)
                 .queue_priorities(QUEUE_PRIORITY);
@@ -300,7 +251,6 @@ pub fn create_vulkan_device_for_video(
         }
     });
 
-    // Open the device with our callback
     let hal_device = unsafe {
         hal_adapter
             .open_with_callback(
@@ -315,7 +265,6 @@ pub fn create_vulkan_device_for_video(
             })?
     };
 
-    // Wrap the hal device as a wgpu device
     let (device, queue) = unsafe {
         adapter
             .create_device_from_hal(

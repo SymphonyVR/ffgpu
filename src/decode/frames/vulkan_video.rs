@@ -7,10 +7,9 @@
 //! AVVkFrame consumer contract is followed: wait on the per-plane timeline
 //! semaphore at `sem_value`, transition to SHADER_READ_ONLY_OPTIMAL, write
 //! layout/access/queue_family back into the AVVkFrame, and — once our
-//! sampling submission has completed (the next import's device poll) — signal
-//! `sem_value + 1` so the decoder's next decode of the same pool image waits
-//! until our reads are done. Set FFGPU_VULKAN_VIDEO_ZERO_COPY=0 to disable
-//! direct sampling.
+//! sampling submission has completed — signal `sem_value + 1` and publish
+//! that incremented value back into the AVVkFrame before releasing it to
+//! FFmpeg. Set FFGPU_VULKAN_VIDEO_ZERO_COPY=0 to disable direct sampling.
 //!
 //! The fallback path copies FFmpeg's Vulkan hardware frames (AVVkFrame) into
 //! wgpu-owned presentation textures. The decode stays on Vulkan hardware,
@@ -21,22 +20,13 @@
 //! access mask, or queue family ownership.
 //!
 //! The destination textures are created via `create_texture_from_hal`
-//! (backed by raw Vulkan images with dedicated memory) so that wgpu's
-//! init tracker marks them as already initialized. This mirrors the
-//! D3D11VA path and avoids the discarding clear that wgpu would
-//! otherwise issue on first use, which would destroy the copied data.
+//! (backed by raw Vulkan images with dedicated memory) so the raw-copy path
+//! can hand initialized image contents to wgpu without a CPU readback.
 //!
-//! Note: wgpu-core starts every `create_texture_from_hal` texture in
-//! `UNINITIALIZED` tracker state, so the first wgpu sampling used to emit a
-//! barrier with `oldLayout=UNDEFINED`, which discards the image contents
-//! (black frames — zero-copy creates a fresh texture every frame, so this hit
-//! every frame). Fixed in the vendored wgpu-core patch
-//! (patches/wgpu-core/src/device/resource.rs): sampled hal-imported textures
-//! now start in `RESOURCE` tracker state (in the ordered uses mask), so no
-//! barrier is emitted on first use. The raw Vulkan transition we record
-//! before handing the frame to wgpu leaves the image in
-//! SHADER_READ_ONLY_OPTIMAL, matching what wgpu-hal derives for
-//! `TextureUses::RESOURCE`.
+//! This branch uses stock wgpu. There is no vendored or patched wgpu-core
+//! dependency. HAL-imported texture tracking is therefore an experimental
+//! integration boundary and must be validated against the actual wgpu
+//! version and target driver.
 
 use super::FrameAdapter;
 use super::GlInteropTicket;
@@ -79,10 +69,8 @@ fn wgpu_to_vk_format(format: wgpu::TextureFormat) -> Result<ash::vk::Format> {
 
 /// Create a wgpu texture backed by a raw Vulkan image with dedicated memory.
 ///
-/// This uses `create_texture_from_hal` which marks the texture as already
-/// initialized (init: false), avoiding wgpu's discarding clear on first use.
-/// This is the same approach used by the D3D11VA path for its shared
-/// presentation texture.
+/// This uses `create_texture_from_hal` with a HAL texture whose contents are
+/// written by the raw Vulkan copy path before wgpu samples them.
 ///
 /// # Safety
 ///
@@ -259,8 +247,6 @@ unsafe fn create_raw_vulkan_texture(
 /// The destination texture(s) are wgpu-owned (via `create_texture_from_hal`)
 /// and reused across frames. Each frame, the decoded VkImage is copied into
 /// the destination via raw Vulkan commands on a dedicated command buffer.
-/// The textures are marked as already initialized (init: false) so wgpu
-/// does not issue a discarding clear on first use.
 struct PresentationTexture {
     /// The wgpu-owned destination texture(s).
     /// For multi-plane (NV12/P010): a single texture.
@@ -543,11 +529,6 @@ impl VulkanVideoFrameAdapter {
     /// Create the persistent presentation texture and bind group.
     ///
     /// This is called once (on the first frame, or when dimensions change).
-    /// The destination textures are created via `create_texture_from_hal`
-    /// (backed by raw Vulkan images with dedicated memory) so that wgpu's
-    /// init tracker marks them as already initialized. This avoids the
-    /// discarding clear that wgpu would otherwise issue on first use,
-    /// which would destroy the data we copy via raw Vulkan commands.
     #[allow(clippy::too_many_arguments)]
     fn create_presentation(
         &mut self,
@@ -693,10 +674,10 @@ impl VulkanVideoFrameAdapter {
     ///
     /// Per the AVVkFrame consumer contract (libavutil/hwcontext_vulkan.h):
     /// at every submission touching the frame's images the consumer must wait
-    /// on `sem[i]` at `sem_value[i]`, then signal `sem_value[i] + 1` so the
-    /// decoder's next decode of the same pool image GPU-waits until our work
-    /// is done. The layout/access/queue_family fields were already written
-    /// back at import time ("updated after every barrier").
+    /// on `sem[i]` at `sem_value[i]`, then signal `sem_value[i] + 1` and
+    /// publish that incremented value back into the AVVkFrame so the decoder's
+    /// next use waits on the correct timeline value. The layout/access/
+    /// queue_family fields were already written back at import time.
     unsafe fn release_zero_copy_frame(frame: &HeldAvFrame, raw_device: &ash::Device) {
         let av_frame = unsafe { frame.frame.as_ref() };
         if av_frame.data[0].is_null() {
@@ -726,19 +707,26 @@ impl VulkanVideoFrameAdapter {
         }
 
         for (sem, value) in deduped {
-            // Monotonic bump: the pool image is still owned by our AVFrame ref,
-            // so no other submission can be signalling this semaphore. The
-            // decoder's next use reads the updated value and waits on it.
+            let next_value = value.saturating_add(1);
             let signal_info = ash::vk::SemaphoreSignalInfo::default()
                 .semaphore(sem)
-                .value(value + 1);
-            if let Err(e) = unsafe { raw_device.signal_semaphore(&signal_info) } {
-                log::error!(
-                    "[VulkanVideo] release: vkSignalSemaphore({:?}, {}) failed: {:?}",
-                    sem,
-                    value + 1,
-                    e
-                );
+                .value(next_value);
+            match unsafe { raw_device.signal_semaphore(&signal_info) } {
+                Ok(()) => {
+                    for i in 0..plane_count {
+                        if vk_frame.sem[i] == sem {
+                            vk_frame.sem_value[i] = next_value;
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!(
+                        "[VulkanVideo] release: vkSignalSemaphore({:?}, {}) failed: {:?}",
+                        sem,
+                        next_value,
+                        e
+                    );
+                }
             }
         }
     }
@@ -859,8 +847,8 @@ impl VulkanVideoFrameAdapter {
         }
 
         // Keep the previous pool image and its external texture wrappers alive
-        // until the queue submission that sampled it completes. The render
-        // queue callback releases it without blocking the event-loop thread.
+        // until the queue submission that sampled it completes. The caller
+        // releases retired frames only after proving completion.
         if let Some(prev) = self.zero_copy_current.take() {
             self.retired_zero_copy.push(prev);
         }
@@ -1427,12 +1415,8 @@ impl FrameAdapter for VulkanVideoFrameAdapter {
                         .dst_queue_family_index(ash::vk::QUEUE_FAMILY_IGNORED);
 
                     // Barrier: transition destination to TRANSFER_DST_OPTIMAL.
-                    // Using UNDEFINED as old_layout is always safe: on the first
-                    // frame the texture is freshly created (UNDEFINED), and on
-                    // subsequent frames it's in SHADER_READ_ONLY_OPTIMAL from
-                    // the previous frame's final barrier. Vulkan allows
-                    // transitioning from UNDEFINED to any layout (it discards
-                    // old contents, which is fine since we're about to overwrite).
+                    // Using UNDEFINED as old_layout discards old contents, which
+                    // is intentional because this frame fully overwrites them.
                     let dst_barrier = ash::vk::ImageMemoryBarrier::default()
                         .image(dst_image)
                         .subresource_range(ash::vk::ImageSubresourceRange {
@@ -1562,17 +1546,11 @@ impl FrameAdapter for VulkanVideoFrameAdapter {
             return Err(Error::UnsupportedBackend);
         }
 
-        // We do NOT call transition_resources here. The destination textures
-        // were created via create_texture_from_hal (init: false), so wgpu's
-        // init tracker considers them already initialized — no discarding
-        // clear will be issued. wgpu's usage tracker starts at UNINITIALIZED
-        // and will transition to RESOURCE on first bind group use, issuing a
-        // barrier with oldLayout=UNDEFINED. Since the actual Vulkan layout is
-        // already SHADER_READ_ONLY_OPTIMAL (from our raw copy's final
-        // barrier), this is the same pattern used by the D3D11VA path and
-        // works correctly in practice. On subsequent frames, wgpu's tracker
-        // will see RESOURCE→RESOURCE (no barrier), which is correct since
-        // our raw copy always leaves the texture in SHADER_READ_ONLY_OPTIMAL.
+        // The destination textures are HAL-imported and the raw Vulkan copy
+        // leaves them in SHADER_READ_ONLY_OPTIMAL before wgpu samples them.
+        // This stock-wgpu integration remains experimental and is covered by
+        // the backend warning in the README rather than relying on a private
+        // wgpu-core patch.
 
         Ok(None)
     }

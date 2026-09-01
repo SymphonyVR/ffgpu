@@ -4,27 +4,44 @@ A small experiment to bridge libavcodec/FFmpeg to WGPU for zero (CPU) copy GPU-a
 
 The primary goal of this library is to bring simple and fast video playback to WGPU-based applications.
 
-Supported platforms:
+> [!IMPORTANT]
+> This fork is an **experimental development branch**. It extends the original ffgpu experiment with an A/V playback stack, software-video fallback, direct YUV consumption, Vulkan Video decoding, and new OpenGL interop paths. The APIs and backend behavior may still change while synchronization, fallback, and cross-vendor coverage are hardened.
 
-| Hardware decoder         | **Vulkan** | **DX12** | **Metal** | **OpenGL** |
-|--------------------------|------------|----------|-----------|------------|
-| **Windows (D3D11VA)**    | Yes        | Yes      | N/A       | CPU        |
-| **MacOS (VideoToolbox)** | CPU        | N/A      | Yes       | CPU        |
-| **Linux (VA-API DRM)**   | Yes        | N/A      | N/A       | CPU        |
+## Experimental additions
 
-I have no plans to support zero-copy on the OpenGL backend on any platform (but PRs for this are welcome of course).
-The same goes for web and mobile platforms (Android and iOS).
+- Audio decode/output and A/V playback coordination, including seeking and clock recovery.
+- Vulkan Video decode on a WGPU-created Vulkan device.
+- Direct sampling of FFmpeg Vulkan hardware frames, with a GPU-copy staging fallback.
+- Windows OpenGL interop for D3D11VA frames without CPU readback.
+- Linux OpenGL zero-copy import from VA-API/DRM PRIME through EGL.
+- Software-only video playback for CPU-renderer/headless fallback paths.
+- Direct YUV plane access so an application can fuse YUV→RGB conversion into its own renderer.
 
-This library is very incomplete and the following features are missing/WIP (roughly in order of priority):
-- Wider YUV format support + 10-bit support
-- Network streams
-- Stream query and selection
-- Subtitle decoding (including from a separate file)
-- Fast thumbnailing; directly downsampled to an RGB texture atlas array from the YUV texture.
+## Backend matrix
 
-Full zero-copy (including GPU copies) is currently unachievable due to upstream limitations. To name a couple:
-- ffmpeg <=8.0 does not expose the ability to modify the texture usage flags on the D3D11VA decoder (in this case, `SHARED`). This has already been fixed in ffmpeg trunk but is unreleased.
-- wgpu does not have any way to (and does not by opportunity) request `VK_EXT_image_drm_format_modifier`. As such, dma buffers given by FFmpeg must be imported and copied to a `VkImage`. Mesa drivers also do not support `VK_EXT_image_drm_format_modifier` on certain graphics cards.
+The table below describes the paths implemented in this experimental branch. `GPU copy` means decoding remains hardware-accelerated and no CPU readback occurs, but an intermediate GPU copy is used. Availability also depends on FFmpeg build options, codec support, driver extensions, and the selected WGPU backend.
+
+| Decode path | **Vulkan** | **DX12** | **Metal** | **OpenGL** | **CPU / no WGPU** |
+|---|---|---|---|---|---|
+| **Vulkan Video (Windows/Linux)** | **Direct sample / GPU-copy fallback** | N/A | N/A | N/A | N/A |
+| **Windows D3D11VA** | Supported interop | **Supported** | N/A | **GPU plane-copy + GL external-memory interop** | N/A |
+| **Linux VA-API / DRM PRIME** | Prefer Vulkan Video on Vulkan backend | N/A | N/A | **Direct EGL/DRM PRIME import** | N/A |
+| **macOS VideoToolbox** | CPU fallback | N/A | **Supported** | CPU fallback | N/A |
+| **Software decode** | CPU upload | CPU upload | CPU upload | CPU upload | **Supported** |
+
+The Vulkan direct-sampling and cross-API OpenGL paths are experimental and should be validated on the target driver/GPU combination before being treated as production-safe.
+
+## Work in progress
+
+This library is still incomplete. Important remaining/hardening work includes:
+
+- Wider YUV format coverage and additional 10-bit validation.
+- Hardware integration tests for Vulkan Video and cross-API synchronization.
+- Network streams.
+- Stream query and selection.
+- Subtitle decoding, including external subtitle files.
+- Fast thumbnailing directly into an RGB texture atlas.
+- Broader cross-vendor and multi-GPU validation.
 
 ## License
 

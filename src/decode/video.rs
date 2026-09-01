@@ -136,7 +136,7 @@ fn calculate_thread_counts(codec_id: ffn::codec::Id, width: u32, height: u32) ->
             // Tile threads handle frame sub-sections (latency critical)
             // Frame threads handle multiple frames (throughput critical)
             let tile_threads = if is_4k { 4usize } else { 2usize };
-            let frame_threads = (cpu_cores - tile_threads).max(4);
+            let frame_threads = cpu_cores.saturating_sub(tile_threads).max(4);
             eprintln!(
                 "[ffgpu] AV1 threading: {} frame threads, {} tile threads ({} cores, {}K)",
                 frame_threads,
@@ -332,7 +332,7 @@ impl Decoder {
             unsafe {
                 (*decoder_ctx.as_mut_ptr()).opaque = (&mut *decoder_data) as *mut _ as _;
                 (*decoder_ctx.as_mut_ptr()).get_format = Some(get_hw_format);
-            };
+            }
 
             // The codec context owns one ref on the hardware device context.
             //
