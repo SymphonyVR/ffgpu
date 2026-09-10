@@ -1,4 +1,4 @@
-use ffgpu::{SoftwareContext, YuvRange, PixelFormat, ColorMatrix, DiscardLevel, MasterClock};
+use ffgpu::SoftwareContext;
 
 const TEST_WEBM: &str = "test 2.webm";
 
