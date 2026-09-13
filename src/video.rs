@@ -364,6 +364,16 @@ impl Video {
         self.frame_decoder.finish_gl_frames(tickets)
     }
 
+    /// Flush/order any pending GL interop work from the most recent update.
+    /// Call this AFTER `queue.submit`.
+    pub fn finish_pending_gl_frames(&mut self) -> Result<()> {
+        let tickets = self.take_pending_gl_tickets();
+        if !tickets.is_empty() {
+            self.finish_gl_frames(&tickets)?;
+        }
+        Ok(())
+    }
+
     fn update_frame(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -532,7 +542,12 @@ impl Video {
                     .serial
                     .load(Ordering::SeqCst);
                 if frame.serial == current_serial {
-                    if let Some(sync_ref_sec) = sync_ref {
+                    if frame.serial != self.last_serial {
+                        // Serial changed (seek or loop rewind)! Reset last_serial and last_pts
+                        // so sync_ref_sec is not clamped to stale pre-seek values.
+                        self.last_serial = frame.serial;
+                        self.last_pts = unsafe { (*frame.frame.as_ptr()).best_effort_timestamp };
+                    } else if let Some(sync_ref_sec) = sync_ref {
                         let pts_sec = unsafe { (*frame.frame.as_ptr()).best_effort_timestamp }
                             as f64
                             * time_base;
@@ -571,8 +586,10 @@ impl Video {
                         break;
                     }
                     FrameResponse::Retry => {
-                        self.last_pts = unsafe { (*frame.frame.as_ptr()).best_effort_timestamp };
-                        self.last_serial = frame.serial;
+                        if frame.serial == current_serial {
+                            self.last_pts = unsafe { (*frame.frame.as_ptr()).best_effort_timestamp };
+                            self.last_serial = frame.serial;
+                        }
                         video_frame_queue.release(frame);
                     }
                     FrameResponse::Requeue => {

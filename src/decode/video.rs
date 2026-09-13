@@ -634,9 +634,30 @@ impl VideoThread {
             let mut prev_frame = None;
 
             while self.state.alive.load(Ordering::Relaxed) {
+                // Drain seek/control messages here, not only at the outer loop.
+                // The inner loop remains active while paused, so handling them
+                // only outside it leaves SkipToTimestamp queued throughout a scrub.
+                while let Ok(message) = self.messages.try_recv() {
+                    match message {
+                        Message::SkipToTimestamp(ts) => {
+                            skip_to_ts = Some(ts);
+                            self.decoder.decoder.skip_frame(DiscardLevel::NonRef.into());
+                        }
+                        Message::SetDiscard(level) => {
+                            self.decoder.decoder.skip_frame(level.into());
+                        }
+                    }
+                }
+
                 if self.state.play_state() == PlayState::Paused {
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
+                }
+
+                let current_meta_serial = self.video_rx.metadata.serial.load(Ordering::Relaxed);
+                if packet_serial != current_meta_serial {
+                    self.decoder.decoder.flush();
+                    packet_serial = current_meta_serial;
                 }
 
                 if self.frame_queue.free_rx.is_empty() {
