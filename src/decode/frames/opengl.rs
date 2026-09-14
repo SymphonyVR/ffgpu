@@ -91,7 +91,7 @@ mod win32_gl_ext {
     type PfnAcquireKeyedMutexWin32EXT = unsafe extern "C" fn(
         gl::types::GLuint,
         gl::types::GLuint64,
-        gl::types::GLuint64,
+        gl::types::GLuint,
     ) -> gl::types::GLboolean;
     type PfnReleaseKeyedMutexWin32EXT =
         unsafe extern "C" fn(gl::types::GLuint, gl::types::GLuint64) -> gl::types::GLboolean;
@@ -1128,7 +1128,7 @@ mod win {
         }
     }
 
-    const INTEROP_RING_SIZE: usize = 3;
+    const INTEROP_RING_SIZE: usize = 4;
 
     /// Which GL interop strategy an `OpenGlWindowsFrameAdapter` should use.
     /// Selected at runtime from `FFGPU_GL_INTEROP` (default `auto`).
@@ -1656,6 +1656,16 @@ mod win {
             }
             Ok(())
         }
+
+        pub(super) fn release_completed_frames(&mut self) -> Result<()> {
+            match self.mode.as_mut() {
+                Some(InteropMode::MemoryObject(ring)) => unsafe { ring.reclaim_completed() },
+                #[cfg(feature = "experimental-wgl-interop")]
+                Some(InteropMode::Wgl(ring)) => unsafe { ring.reclaim_completed() },
+                None => {}
+            }
+            Ok(())
+        }
     }
 
     impl Drop for D3D11GlImport {
@@ -1984,6 +1994,7 @@ mod win {
                     .as_hal::<wgpu::hal::gles::Api>()
                     .ok_or(Error::UnsupportedBackend)?;
                 let _gl_guard = hal.context().lock();
+                let _ = gl::GetError();
                 let acquire_ok_y = (self.ext.acquire_keyed_mutex)(
                     self.slots[slot_idx].y_mem,
                     1,
@@ -1995,9 +2006,10 @@ mod win {
                     KEYED_MUTEX_TIMEOUT_MS,
                 );
                 if acquire_ok_y == 0 || acquire_ok_uv == 0 {
+                    let err = gl::GetError();
                     eprintln!(
-                        "[opengl] memory-object: glAcquireKeyedMutexWin32EXT failed (y={}, uv={})",
-                        acquire_ok_y, acquire_ok_uv
+                        "[opengl] memory-object: glAcquireKeyedMutexWin32EXT failed (y={}, uv={}, err=0x{:X})",
+                        acquire_ok_y, acquire_ok_uv, err
                     );
                     // Try to release back to key=0 so the producer can move on.
                     let _ = (self.ext.release_keyed_mutex)(self.slots[slot_idx].y_mem, 0);
@@ -2086,19 +2098,22 @@ mod win {
                         }
                         continue;
                     }
+                    let _ = gl::GetError();
                     let r_y = (self.ext.release_keyed_mutex)(slot.y_mem, 0);
+                    let err_y_rel = gl::GetError();
                     let r_uv = (self.ext.release_keyed_mutex)(slot.uv_mem, 0);
+                    let err_uv_rel = gl::GetError();
                     gl::DeleteSync(fence);
                     slot.fence = None;
                     slot.state = MemoryObjectSlotState::Free;
                     released_any = true;
-                    if r_y == 0 || r_uv == 0 {
+                    if err_y_rel != gl::NO_ERROR || err_uv_rel != gl::NO_ERROR {
                         static WARNED: std::sync::atomic::AtomicBool =
                             std::sync::atomic::AtomicBool::new(false);
                         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                             eprintln!(
-                                "[opengl] memory-object: keyed-mutex release returned (y={}, uv={}); slot freed after fence",
-                                r_y, r_uv
+                                "[opengl] memory-object: glReleaseKeyedMutexWin32EXT error (err_y=0x{:X}, err_uv=0x{:X}, r_y={}, r_uv={})",
+                                err_y_rel, err_uv_rel, r_y, r_uv
                             );
                         }
                     }
@@ -2169,7 +2184,7 @@ mod win {
     /// 100 ms is generous at 60 fps (16 ms/frame) and short enough to surface
     /// a stuck producer via the `Err(TextureShare)` path instead of freezing
     /// the render thread.
-    const KEYED_MUTEX_TIMEOUT_MS: gl::types::GLuint64 = 100;
+    const KEYED_MUTEX_TIMEOUT_MS: gl::types::GLuint = 100;
 
     /// Read the D3D11 device's adapter LUID via `IDXGIDevice::GetAdapter`.
     /// Returns the complete eight-byte Windows LUID in native byte order.
@@ -3433,6 +3448,13 @@ impl FrameAdapter for OpenGlWindowsFrameAdapter {
     fn cancel_gl_frame(&mut self, ticket: GlInteropTicket) -> Result<()> {
         if let Some(imported) = self.imported.as_mut() {
             imported.cancel_gl_frame(ticket)?;
+        }
+        Ok(())
+    }
+
+    fn release_completed_frames(&mut self, _device: &wgpu::Device) -> Result<()> {
+        if let Some(imported) = self.imported.as_mut() {
+            imported.release_completed_frames()?;
         }
         Ok(())
     }
