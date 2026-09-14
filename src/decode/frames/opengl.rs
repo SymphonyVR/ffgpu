@@ -1192,6 +1192,7 @@ mod win {
         uv_wgpu: Option<wgpu::Texture>,
         y_view: Option<wgpu::TextureView>,
         uv_view: Option<wgpu::TextureView>,
+        bind_group: Option<wgpu::BindGroup>,
         state: WglSlotState,
         /// GL sync object inserted after the submitting `queue.submit`. `None`
         /// until the slot enters `Submitted`.
@@ -1225,6 +1226,7 @@ mod win {
         uv_wgpu: Option<wgpu::Texture>,
         y_view: Option<wgpu::TextureView>,
         uv_view: Option<wgpu::TextureView>,
+        bind_group: Option<wgpu::BindGroup>,
         state: MemoryObjectSlotState,
         /// Fence inserted after the wgpu GL submission that sampled this slot.
         fence: Option<gl::types::GLsync>,
@@ -1253,11 +1255,6 @@ mod win {
         lock: Option<unsafe extern "C" fn(*mut c_void)>,
         unlock: Option<unsafe extern "C" fn(*mut c_void)>,
         lock_ctx: *mut c_void,
-        /// Cached YUV bind group built from the first slot's views; used
-        /// only to keep the engine's `direct_yuv()` gate returning `true`.
-        /// The actual draw uses `plane_views()` to build a fresh bind group
-        /// from the current slot's views via `PipelineCache`.
-        bind_group: Option<wgpu::BindGroup>,
         /// Layout identity of the YUV plane formats (R8/RG8 or R16/RG16,
         /// packed NV12-style). Returned by `layout_identity()`.
         layout_identity: layout::FrameDescriptor<()>,
@@ -1424,6 +1421,7 @@ mod win {
         lock: Option<unsafe extern "C" fn(*mut c_void)>,
         unlock: Option<unsafe extern "C" fn(*mut c_void)>,
         lock_ctx: *mut c_void,
+        layout_identity: layout::FrameDescriptor<()>,
     }
 
     /// Active interop strategy. The cross-vendor `MemoryObject` ring is the
@@ -1624,7 +1622,7 @@ mod win {
             match &self.mode {
                 Some(InteropMode::MemoryObject(ring)) => ring.bind_group(),
                 #[cfg(feature = "experimental-wgl-interop")]
-                Some(InteropMode::Wgl(_)) => None,
+                Some(InteropMode::Wgl(ring)) => ring.bind_group(),
                 None => None,
             }
         }
@@ -1633,7 +1631,7 @@ mod win {
             match &self.mode {
                 Some(InteropMode::MemoryObject(ring)) => ring.layout_identity(),
                 #[cfg(feature = "experimental-wgl-interop")]
-                Some(InteropMode::Wgl(_)) => None,
+                Some(InteropMode::Wgl(ring)) => ring.layout_identity(),
                 None => None,
             }
         }
@@ -1813,27 +1811,26 @@ mod win {
                     slots.push(slot);
                 }
 
-                // (6) Cache a single bind group. The engine reads this for the
-                // `direct_yuv()` gate; the actual draw uses `plane_views()` to
-                // build a fresh bind group from the current slot's views. We
-                // build against the first slot's views — if the engine ever
-                // uses this bind group for the copy_to_rgb fallback, it
-                // samples the first slot's stale frames. The engine's
-                // `direct_yuv` path never hits copy_to_rgb.
-                let (y_view, uv_view) = match (&slots[0].y_view, &slots[0].uv_view) {
-                    (Some(y), Some(uv)) => (y, uv),
-                    _ => return Err(Error::TextureShare),
-                };
-                let bind_group = pipeline_cache.bind_frame_textures(
-                    &layout::FrameDescriptor {
-                        planes: layout::PlaneLayout::PackedYUV420([
-                            y_view.clone(),
-                            uv_view.clone(),
-                        ]),
-                        depth,
-                    },
-                    color_space,
-                );
+                // (6) Build per-slot bind groups. When copy_to_rgb or direct_yuv
+                // samples the live frame, it retrieves the bind group of the
+                // currently locked slot so frames advance continuously.
+                for slot in &mut slots {
+                    let (y_view, uv_view) = match (&slot.y_view, &slot.uv_view) {
+                        (Some(y), Some(uv)) => (y, uv),
+                        _ => return Err(Error::TextureShare),
+                    };
+                    let bg = pipeline_cache.bind_frame_textures(
+                        &layout::FrameDescriptor {
+                            planes: layout::PlaneLayout::PackedYUV420([
+                                y_view.clone(),
+                                uv_view.clone(),
+                            ]),
+                            depth,
+                        },
+                        color_space,
+                    );
+                    slot.bind_group = Some(bg);
+                }
                 let _ = pipeline_cache; // (used above; kept for symmetry with the WGL path)
 
                 // (7) Build the layout identity used by the engine to select
@@ -1867,7 +1864,6 @@ mod win {
                     lock,
                     unlock,
                     lock_ctx,
-                    bind_group: Some(bind_group),
                     layout_identity,
                 })
             }
@@ -1889,13 +1885,35 @@ mod win {
                     return Err(Error::InvalidFrame);
                 }
 
-                // (a) Pick a free slot. Starvation drops the frame: the engine
-                // keeps sampling the last locked slot instead of blocking.
-                let slot_idx = match self
+                // (a) Pick a free slot. If all slots are busy, wait on the oldest submitted slot
+                // with a timeout instead of immediately dropping the frame.
+                let mut slot_idx = self
                     .slots
                     .iter()
-                    .position(|s| s.state == MemoryObjectSlotState::Free)
-                {
+                    .position(|s| s.state == MemoryObjectSlotState::Free);
+
+                if slot_idx.is_none() {
+                    if let Some(pos) = self.slots.iter().position(|s| s.state == MemoryObjectSlotState::Submitted && s.fence.is_some()) {
+                        let hal = self.device.as_hal::<wgpu::hal::gles::Api>();
+                        if let Some(hal) = hal {
+                            let _gl_guard = hal.context().lock();
+                            let slot = &mut self.slots[pos];
+                            if let Some(fence) = slot.fence {
+                                let status = gl::ClientWaitSync(fence, gl::SYNC_FLUSH_COMMANDS_BIT, 33_000_000);
+                                if status == gl::ALREADY_SIGNALED || status == gl::CONDITION_SATISFIED || status == gl::WAIT_FAILED {
+                                    let _ = (self.ext.release_keyed_mutex)(slot.y_mem, 0);
+                                    let _ = (self.ext.release_keyed_mutex)(slot.uv_mem, 0);
+                                    gl::DeleteSync(fence);
+                                    slot.fence = None;
+                                    slot.state = MemoryObjectSlotState::Free;
+                                    slot_idx = Some(pos);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let slot_idx = match slot_idx {
                     Some(i) => i,
                     None => {
                         eprintln!(
@@ -2055,6 +2073,14 @@ mod win {
                     }
                     let status = gl::ClientWaitSync(fence, gl::SYNC_FLUSH_COMMANDS_BIT, 0);
                     if status != gl::ALREADY_SIGNALED && status != gl::CONDITION_SATISFIED {
+                        if status == gl::WAIT_FAILED {
+                            eprintln!("[opengl] memory-object: glClientWaitSync returned WAIT_FAILED");
+                            let _ = (self.ext.release_keyed_mutex)(slot.y_mem, 0);
+                            let _ = (self.ext.release_keyed_mutex)(slot.uv_mem, 0);
+                            gl::DeleteSync(fence);
+                            slot.fence = None;
+                            slot.state = MemoryObjectSlotState::Free;
+                        }
                         continue;
                     }
                     let r_y = (self.ext.release_keyed_mutex)(slot.y_mem, 0);
@@ -2114,11 +2140,14 @@ mod win {
             ])
         }
 
-        /// Cached YUV bind group built from the first slot's views. Kept only
-        /// so the engine's `direct_yuv()` gate (`bind_group().is_some()`)
-        /// returns true; the actual draw uses `plane_views()`.
+        /// Bind group for the currently locked slot (or the first slot if no
+        /// frame has been locked yet).
         pub(super) fn bind_group(&self) -> Option<&wgpu::BindGroup> {
-            self.bind_group.as_ref()
+            let slot = match self.current_slot {
+                Some(id) => self.slots.iter().find(|s| s.slot_id == id)?,
+                None => self.slots.first()?,
+            };
+            slot.bind_group.as_ref()
         }
 
         pub(super) fn layout_identity(&self) -> Option<layout::FrameDescriptor<()>> {
@@ -2381,6 +2410,7 @@ mod win {
                 uv_wgpu: Some(uv_wgpu),
                 y_view: Some(y_view),
                 uv_view: Some(uv_view),
+                bind_group: None,
                 state: MemoryObjectSlotState::Free,
                 fence: None,
             })
@@ -2544,8 +2574,39 @@ mod win {
                     slots.push(slot);
                 }
 
-                let _ = pipeline_cache; // unused on WGL path; kept for symmetry
-                let _ = color_space;
+                for slot in &mut slots {
+                    let (y_view, uv_view) = match (&slot.y_view, &slot.uv_view) {
+                        (Some(y), Some(uv)) => (y, uv),
+                        _ => return Err(Error::TextureShare),
+                    };
+                    let bg = pipeline_cache.bind_frame_textures(
+                        &layout::FrameDescriptor {
+                            planes: layout::PlaneLayout::PackedYUV420([
+                                y_view.clone(),
+                                uv_view.clone(),
+                            ]),
+                            depth,
+                        },
+                        color_space,
+                    );
+                    slot.bind_group = Some(bg);
+                }
+
+                let (y_fmt, _uv_fmt) = match depth {
+                    layout::Depth::D16 => (
+                        wgpu::TextureFormat::R16Unorm,
+                        wgpu::TextureFormat::Rg16Unorm,
+                    ),
+                    _ => (wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm),
+                };
+                let layout_identity = layout::FrameDescriptor {
+                    planes: layout::PlaneLayout::PackedYUV420([
+                        y_fmt,
+                        wgpu::TextureFormat::Rg8Unorm,
+                    ]),
+                    depth,
+                }
+                .as_identity();
 
                 Ok(GlInteropRing {
                     core,
@@ -2561,6 +2622,7 @@ mod win {
                     lock,
                     unlock,
                     lock_ctx,
+                    layout_identity,
                 })
             }
         }
@@ -2576,7 +2638,7 @@ mod win {
                 for slot in self.slots.iter_mut() {
                     if let (WglSlotState::Submitted, Some(fence)) = (slot.state, slot.fence) {
                         let status = gl::ClientWaitSync(fence, gl::SYNC_FLUSH_COMMANDS_BIT, 0);
-                        if status == gl::ALREADY_SIGNALED || status == gl::CONDITION_SATISFIED {
+                        if status == gl::ALREADY_SIGNALED || status == gl::CONDITION_SATISFIED || status == gl::WAIT_FAILED {
                             gl::DeleteSync(fence);
                             slot.fence = None;
                             Self::unlock_slot(&self.wgl, self.dx_device, slot);
@@ -2617,11 +2679,31 @@ mod win {
                 // Pick a Free slot. On starvation, drop this frame (the engine
                 // keeps sampling the last locked slot) rather than overwrite an
                 // in-use one or block the renderer.
-                let slot_idx = match self
+                let mut slot_idx = self
                     .slots
                     .iter()
-                    .position(|s| s.state == WglSlotState::Free)
-                {
+                    .position(|s| s.state == WglSlotState::Free);
+
+                if slot_idx.is_none() {
+                    if let Some(pos) = self.slots.iter().position(|s| s.state == WglSlotState::Submitted && s.fence.is_some()) {
+                        let hal = self.device.as_hal::<wgpu::hal::gles::Api>();
+                        if let Some(hal) = hal {
+                            let _gl_guard = hal.context().lock();
+                            let slot = &mut self.slots[pos];
+                            if let Some(fence) = slot.fence {
+                                let status = gl::ClientWaitSync(fence, gl::SYNC_FLUSH_COMMANDS_BIT, 33_000_000);
+                                if status == gl::ALREADY_SIGNALED || status == gl::CONDITION_SATISFIED || status == gl::WAIT_FAILED {
+                                    gl::DeleteSync(fence);
+                                    slot.fence = None;
+                                    Self::unlock_slot(&self.wgl, self.dx_device, slot);
+                                    slot_idx = Some(pos);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let slot_idx = match slot_idx {
                     Some(i) => i,
                     None => {
                         eprintln!("[opengl] interop ring starvation: dropping decoded frame");
@@ -2733,6 +2815,18 @@ mod win {
                 slot.y_view.as_ref()?.clone(),
                 slot.uv_view.as_ref()?.clone(),
             ])
+        }
+
+        pub(super) fn bind_group(&self) -> Option<&wgpu::BindGroup> {
+            let slot = match self.current_slot {
+                Some(id) => self.slots.iter().find(|s| s.slot_id == id)?,
+                None => self.slots.first()?,
+            };
+            slot.bind_group.as_ref()
+        }
+
+        pub(super) fn layout_identity(&self) -> Option<layout::FrameDescriptor<()>> {
+            Some(self.layout_identity)
         }
 
         /// Insert ONE GL fence for every submitted ticket's slot, after the
@@ -2931,6 +3025,7 @@ mod win {
                 uv_wgpu: Some(uv_wgpu),
                 y_view: Some(y_view),
                 uv_view: Some(uv_view),
+                bind_group: None,
                 state: WglSlotState::Free,
                 fence: None,
             })
