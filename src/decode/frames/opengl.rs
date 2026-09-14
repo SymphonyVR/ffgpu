@@ -1906,6 +1906,7 @@ mod win {
                                     gl::DeleteSync(fence);
                                     slot.fence = None;
                                     slot.state = MemoryObjectSlotState::Free;
+                                    gl::Flush();
                                     slot_idx = Some(pos);
                                 }
                             }
@@ -2064,6 +2065,7 @@ mod win {
                     None => return,
                 };
                 let _gl_guard = hal.context().lock();
+                let mut released_any = false;
                 for slot in self.slots.iter_mut() {
                     let Some(fence) = slot.fence else {
                         continue;
@@ -2080,21 +2082,29 @@ mod win {
                             gl::DeleteSync(fence);
                             slot.fence = None;
                             slot.state = MemoryObjectSlotState::Free;
+                            released_any = true;
                         }
                         continue;
                     }
                     let r_y = (self.ext.release_keyed_mutex)(slot.y_mem, 0);
                     let r_uv = (self.ext.release_keyed_mutex)(slot.uv_mem, 0);
-                    if r_y != 0 && r_uv != 0 {
-                        gl::DeleteSync(fence);
-                        slot.fence = None;
-                        slot.state = MemoryObjectSlotState::Free;
-                    } else {
-                        eprintln!(
-                            "[opengl] memory-object: keyed-mutex release failed after fence (y={}, uv={})",
-                            r_y, r_uv
-                        );
+                    gl::DeleteSync(fence);
+                    slot.fence = None;
+                    slot.state = MemoryObjectSlotState::Free;
+                    released_any = true;
+                    if r_y == 0 || r_uv == 0 {
+                        static WARNED: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            eprintln!(
+                                "[opengl] memory-object: keyed-mutex release returned (y={}, uv={}); slot freed after fence",
+                                r_y, r_uv
+                            );
+                        }
                     }
+                }
+                if released_any {
+                    gl::Flush();
                 }
             }
         }
