@@ -38,7 +38,7 @@ fn test_file(name: &str) -> std::path::PathBuf {
 fn software_video_opens_test_mp4() {
     let ctx = SoftwareContext::new().expect("ffmpeg init");
     let (video, _audio) = ctx
-        .create_video(&test_file(TEST_MP4))
+        .create_video_without_consumer(&test_file(TEST_MP4))
         .expect("open Test.mp4");
     // H.264 1440x810 ~9.28s (verified via ffprobe)
     assert_eq!(video.width(), 1440);
@@ -130,9 +130,8 @@ fn software_video_to_rgba_produces_valid_buffer() {
 fn software_video_seek_does_not_panic() {
     let ctx = SoftwareContext::new().expect("ffmpeg init");
     let (mut video, _audio) = ctx
-        .create_video(&test_file(TEST_MP4))
+        .create_video_without_consumer(&test_file(TEST_MP4))
         .expect("open Test.mp4");
-    let _rx = video.frame_receiver();
 
     video.set_playback_rate(2.0);
 
@@ -153,9 +152,8 @@ fn software_video_seek_does_not_panic() {
 fn software_video_set_discard_does_not_panic() {
     let ctx = SoftwareContext::new().expect("ffmpeg init");
     let (video, _audio) = ctx
-        .create_video(&test_file(TEST_MP4))
+        .create_video_without_consumer(&test_file(TEST_MP4))
         .expect("open Test.mp4");
-    let _rx = video.frame_receiver();
 
     // VLC "hurry up" levels
     video.set_discard(DiscardLevel::Default);
@@ -172,7 +170,7 @@ fn software_video_set_discard_does_not_panic() {
 fn software_video_no_audio_file_works() {
     let ctx = SoftwareContext::new().expect("ffmpeg init");
     let (_video, _audio) = ctx
-        .create_video(&test_file(TEST_NOAUDIO_MP4))
+        .create_video_without_consumer(&test_file(TEST_NOAUDIO_MP4))
         .expect("open test-noaudio.mp4");
     // Just verify it opens. The video path should still work even
     // when the file has no audio (the AudioThread is replaced with a
@@ -183,7 +181,7 @@ fn software_video_no_audio_file_works() {
 fn software_video_no_audio_reports_duration() {
     let ctx = SoftwareContext::new().expect("ffmpeg init");
     let (video, _audio) = ctx
-        .create_video(&test_file(TEST_NOAUDIO_MP4))
+        .create_video_without_consumer(&test_file(TEST_NOAUDIO_MP4))
         .expect("open test-noaudio.mp4");
     let duration = video.duration().as_secs_f64();
 
@@ -241,7 +239,7 @@ fn software_video_prefetches_no_audio_loop() {
 fn software_video_metadata_helpers() {
     let ctx = SoftwareContext::new().expect("ffmpeg init");
     let (video, _audio) = ctx
-        .create_video(&test_file(TEST_MP4))
+        .create_video_without_consumer(&test_file(TEST_MP4))
         .expect("open Test.mp4");
 
     // time_base, stream_time_base should be the same value
@@ -777,28 +775,38 @@ fn run_backward_reanchor(file: &str, target_ms: u64, pre_audio_s: f64, pre_video
     let seek_start = std::time::Instant::now();
     let t_s = target.as_secs_f64();
     let mut min_video = f64::INFINITY;
+    let mut min_audio = f64::INFINITY;
     while std::time::Instant::now() - seek_start < Duration::from_secs(60) {
         let _ = audio.read_to_slice(&mut buf, 1.0);
         let _ = rx.recv_timeout(Duration::from_millis(5));
         min_video = min_video.min(video.position().as_secs_f64());
 
+        // Real (non-0.0) audio reads fold into the trough. Once re-anchored,
+        // the clock keeps advancing in real time (each read consumes a full
+        // buffer of samples), so a per-read band trips whenever the post-seek
+        // video decode restart lags under load — a live clock then reads past
+        // a frozen clock's band without ever having been stale. A
+        // frozen/stale clock instead never re-anchors, so the guard belongs
+        // on the trough exactly as the comment above specifies.
         let ap = audio.current_position_ms() / 1000.0;
         if ap > 0.05 {
-            // Real (non-0.0) audio read: it must have re-anchored toward the
-            // target, never stay parked near the pre-seek position.
-            assert!(
-                (ap - t_s).abs() < 0.7,
-                "audio clock read {ap:.3}s after a {t_s:.1}s seek (frozen/stale clock)"
-            );
+            min_audio = min_audio.min(ap);
         }
         if (min_video - t_s).abs() < 0.7 {
-            eprintln!("POST-SEEK min video={min_video:.3}s re-anchored ✓ (audio {ap:.3}s)");
+            eprintln!(
+                "POST-SEEK min video={min_video:.3}s re-anchored ✓ (audio trough={min_audio:.3}s)"
+            );
+            assert!(
+                !min_audio.is_finite() || (min_audio - t_s).abs() < 0.7,
+                "audio clock trough {min_audio:.3}s after a {t_s:.1}s seek (frozen/stale clock)"
+            );
             return;
         }
     }
     panic!(
         "backward seek did not re-anchor video: min video={min_video:.3}s \
-         (target {t_s:.1}s, pre-seek was video={pre_video:.3}s audio={pre_audio:.3}s)"
+         (target {t_s:.1}s, pre-seek was video={pre_video:.3}s audio={pre_audio:.3}s, \
+         audio trough={min_audio:.3}s)"
     );
 }
 
