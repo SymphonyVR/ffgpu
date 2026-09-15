@@ -499,12 +499,22 @@ impl Video {
             && self.state.is_eof.load(Ordering::SeqCst)
             && self.looping
             && play_state != PlayState::Paused
+            && !self.state.fatal_eof.load(Ordering::Relaxed)
         {
             let _ = self.read_messages.send(ReadMessage::SeekStream {
                 ts: 0,
                 mode: SeekMode::Fast,
                 forward: false,
             });
+        }
+
+        // Terminal-corrupt stream: never post the rewind fallback again,
+        // and park at the paused cadence so the per-tick 50ms storm stops.
+        if self.state.fatal_eof.load(Ordering::Relaxed)
+            && self.queued_frame.is_none()
+            && video_frame_queue.queued_len() == 0
+        {
+            return Ok((Duration::from_millis(50), false));
         }
 
         if play_state == PlayState::Paused

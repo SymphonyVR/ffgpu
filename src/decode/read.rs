@@ -170,7 +170,18 @@ pub(crate) struct ReadThread {
     input: Input,
     state: Arc<DecoderState>,
     messages: Receiver<ReadMessage>,
+    /// Consecutive loop rewinds that produced zero decoded video frames
+    /// (corrupt/truncated stream). Latched into `state.fatal_eof` at the
+    /// cap; reset by any successful seek or real decode progress.
+    rewinds_without_progress: u32,
+    /// VideoThread frame counter snapshot taken at the last rewind.
+    frames_decoded_snapshot: u64,
 }
+
+/// Loop rewinds tolerated with zero decoded frames before the stream is
+/// declared terminally corrupt. 3 covers the bad-initial-rewind cases the
+/// GPU update() fallback exists for without looping forever on garbage.
+const MAX_STALLED_REWINDS: u32 = 3;
 
 impl ReadThread {
     pub fn new(input: Input, pbs: Arc<DecoderState>, messages: Receiver<ReadMessage>) -> Self {
@@ -178,6 +189,8 @@ impl ReadThread {
             input,
             state: pbs,
             messages,
+            rewinds_without_progress: 0,
+            frames_decoded_snapshot: 0,
         }
     }
 
@@ -225,6 +238,15 @@ impl ReadThread {
                 log::error!("failed to seek stream: {}", error);
             } else {
                 self.state.is_eof.store(false, Ordering::SeqCst);
+                // A successful seek re-arms the loop-stall detector: the
+                // stream is only fatally corrupt relative to a position the
+                // user hasn't moved away from.
+                self.state.fatal_eof.store(false, Ordering::Relaxed);
+                self.rewinds_without_progress = 0;
+                self.frames_decoded_snapshot = self
+                    .state
+                    .frames_decoded_since_rewind
+                    .load(Ordering::Relaxed);
 
                 video_stream.packets.flush();
                 video_stream.packets.set_loop_index(0);
@@ -303,6 +325,14 @@ impl ReadThread {
 
             let is_eof = self.state.is_eof.load(Ordering::SeqCst);
 
+            // Terminal-corrupt streams park here regardless of play_state:
+            // nothing drains the queues anymore, so the 100ms cadence keeps
+            // the read thread effectively idle until a seek re-arms it.
+            if self.state.fatal_eof.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+
             if play_state == PlayState::Playing && is_eof && video_stream.frames.queue_rx.is_empty()
             {
                 std::thread::sleep(Duration::from_millis(10));
@@ -329,25 +359,58 @@ impl ReadThread {
                             .push_null(ffn::Packet::empty(), audio_stream.metadata.index);
 
                         if self.state.looping.load(Ordering::Relaxed) {
-                            let rewind = unsafe {
-                                ff::avformat_seek_file(
-                                    self.input.format_ctx.as_mut_ptr(),
-                                    -1,
-                                    i64::MIN,
-                                    0,
-                                    i64::MAX,
-                                    ff::AVSEEK_FLAG_BACKWARD,
-                                )
-                            } == 0;
+                            // Stall detector: a rewind that produced no
+                            // decoded frames since the previous rewind means
+                            // the demuxer is re-reading the same undecodable
+                            // bytes (truncated/corrupt stream). Count those;
+                            // after MAX_STALLED_REWINDS the stream is
+                            // declared terminally broken and rewinding stops.
+                            let decoded = self
+                                .state
+                                .frames_decoded_since_rewind
+                                .load(Ordering::Relaxed);
+                            if decoded != self.frames_decoded_snapshot {
+                                self.rewinds_without_progress = 0;
+                                self.frames_decoded_snapshot = decoded;
+                            } else {
+                                self.rewinds_without_progress += 1;
+                            }
 
-                            if rewind {
-                                let next_loop =
-                                    self.state.loop_index.fetch_add(1, Ordering::SeqCst) + 1;
-                                video_stream.packets.set_loop_index(next_loop);
-                                audio_stream.packets.set_loop_index(next_loop);
-                                self.state.loop_events.fetch_add(1, Ordering::SeqCst);
-                                self.state.is_eof.store(false, Ordering::SeqCst);
-                                continue;
+                            if self.rewinds_without_progress >= MAX_STALLED_REWINDS {
+                                if !self.state.fatal_eof.swap(true, Ordering::Relaxed) {
+                                    log::error!(
+                                        "stream stalled: {MAX_STALLED_REWINDS} loop rewinds \
+                                         without a decoded frame; stream treated as terminal \
+                                         until next successful seek"
+                                    );
+                                }
+                                // Fall through: is_eof = true, no rewind.
+                            } else {
+                                let rewind = unsafe {
+                                    ff::avformat_seek_file(
+                                        self.input.format_ctx.as_mut_ptr(),
+                                        -1,
+                                        i64::MIN,
+                                        0,
+                                        i64::MAX,
+                                        ff::AVSEEK_FLAG_BACKWARD,
+                                    )
+                                } == 0;
+
+                                if rewind {
+                                    let next_loop =
+                                        self.state.loop_index.fetch_add(1, Ordering::SeqCst) + 1;
+                                    video_stream.packets.set_loop_index(next_loop);
+                                    audio_stream.packets.set_loop_index(next_loop);
+                                    self.state.loop_events.fetch_add(1, Ordering::SeqCst);
+                                    self.state.is_eof.store(false, Ordering::SeqCst);
+                                    // A rewind that fails to produce frames
+                                    // is the failure mode above; a rewind
+                                    // whose frames decode fine resets the
+                                    // counter on the next EOF via the
+                                    // snapshot diff.
+                                    continue;
+                                }
                             }
                         }
 

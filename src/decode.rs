@@ -53,6 +53,16 @@ pub(crate) struct DecoderState {
     pub play_state: AtomicU8,
     pub lifecycle: AtomicU8,
     pub is_eof: AtomicBool,
+    /// Set by the read thread when a looping stream rewound
+    /// MAX_STALLED_REWINDS times without the video decoder producing a
+    /// single frame (truncated/corrupt stream). Terminal until the next
+    /// successful seek clears it. Heuristic only - Relaxed everywhere.
+    pub fatal_eof: AtomicBool,
+    /// Monotonic count of video frames the VideoThread has handed to the
+    /// frame queue. The read thread snapshots it at each loop rewind to
+    /// tell "healthy loop" (count advances) from "corrupt stall" (count
+    /// frozen). Never reset - comparisons are snapshot deltas.
+    pub frames_decoded_since_rewind: AtomicU64,
     pub current_pts: AtomicI64,
     pub looping: AtomicBool,
     pub loop_index: AtomicU64,
@@ -87,6 +97,8 @@ impl DecoderState {
             play_state: AtomicU8::new(PlayState::Playing as u8),
             lifecycle: AtomicU8::new(Lifecycle::Active as u8),
             is_eof: AtomicBool::new(false),
+            fatal_eof: AtomicBool::new(false),
+            frames_decoded_since_rewind: AtomicU64::new(0),
             current_pts: AtomicI64::new(0),
             looping: AtomicBool::new(false),
             loop_index: AtomicU64::new(0),
@@ -116,6 +128,8 @@ impl DecoderState {
             play_state: AtomicU8::new(PlayState::Playing as u8),
             lifecycle: AtomicU8::new(Lifecycle::Active as u8),
             is_eof: AtomicBool::new(false),
+            fatal_eof: AtomicBool::new(false),
+            frames_decoded_since_rewind: AtomicU64::new(0),
             current_pts: AtomicI64::new(0),
             looping: AtomicBool::new(false),
             loop_index: AtomicU64::new(0),
@@ -381,7 +395,15 @@ impl FrameQueue {
             ff::av_frame_move_ref(dst.frame.as_mut_ptr(), frame.as_mut_ptr());
         }
         dst.serial = serial;
-        self.queue_tx.send(dst).is_ok()
+        if self.queue_tx.send(dst).is_err() {
+            // Consumer side gone: the recycled frame handle is dropped here,
+            // permanently shrinking the free pool. Capacity accounting keeps
+            // this unreachable today, but make it visible if that changes.
+            log::error!("FrameQueue::send: frame dropped, free pool shrunk (consumer gone)");
+            false
+        } else {
+            true
+        }
     }
 
     pub fn queued_len(&self) -> usize {
@@ -394,7 +416,12 @@ impl FrameQueue {
 
     pub fn release(&self, mut frame: Frame) {
         unsafe { ff::av_frame_unref(frame.frame.as_mut_ptr()) };
-        self.free_tx.send(frame).unwrap();
+        if self.free_tx.send(frame).is_err() {
+            // Capacity accounting makes a bound-free push infallible; a
+            // failure means the pool account drifted or the consumer is
+            // gone. Log instead of panicking in a hot path.
+            log::error!("FrameQueue::release: free push failed (pool accounting drift)");
+        }
     }
 
     pub fn flush(&self) {

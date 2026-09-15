@@ -525,6 +525,11 @@ impl VideoThread {
         let mut frame = unsafe { ffn::Frame::empty() };
 
         let mut skip_to_ts = None;
+        // Serial captured when the current skip_to_ts walk was adopted. A
+        // newer SeekStream bumps the packet-queue serial while the walk is
+        // still in flight; comparing against this lets the loop abandon a
+        // walk whose target the user already moved past.
+        let mut walk_serial: Option<u32> = None;
         let mut diag_count: u32 = 0;
 
         // Pipeline timing (logged every 30 frames)
@@ -615,6 +620,8 @@ impl VideoThread {
                 match message {
                     Message::SkipToTimestamp(ts) => {
                         skip_to_ts = Some(ts);
+                        walk_serial =
+                            Some(self.video_rx.metadata.serial.load(Ordering::Relaxed));
                         // Hurry-up accurate seek: decode only reference frames
                         // during the keyframe→target walk. B-frames are not
                         // referenced by any other frame, so dropping them keeps
@@ -641,6 +648,8 @@ impl VideoThread {
                     match message {
                         Message::SkipToTimestamp(ts) => {
                             skip_to_ts = Some(ts);
+                            walk_serial =
+                                Some(self.video_rx.metadata.serial.load(Ordering::Relaxed));
                             self.decoder.decoder.skip_frame(DiscardLevel::NonRef.into());
                         }
                         Message::SetDiscard(level) => {
@@ -651,6 +660,20 @@ impl VideoThread {
 
                 if self.state.play_state() == PlayState::Paused {
                     std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+
+                // Stale-walk abort: a newer SeekStream bumped the packet
+                // queue serial since this skip_to_ts walk was adopted. Drop
+                // the walk (and the hurry-up skip_frame) and loop around so
+                // the serial-change flush + newer SkipToTimestamp adoption
+                // run normally. Stable serial (single seek) never enters.
+                if let Some(ws) = walk_serial
+                    && self.video_rx.metadata.serial.load(Ordering::Relaxed) != ws
+                {
+                    skip_to_ts = None;
+                    walk_serial = None;
+                    self.decoder.decoder.skip_frame(DiscardLevel::Default.into());
                     continue;
                 }
 
@@ -765,6 +788,13 @@ impl VideoThread {
 
                 if let Some(frame) = frame {
                     prev_frame = None;
+                    // Monotonic decoded-frame counter: the read thread
+                    // snapshots this at each loop rewind to distinguish a
+                    // healthy loop from a stalled corrupt stream. Relaxed —
+                    // it is a progress heuristic, not synchronization.
+                    self.state
+                        .frames_decoded_since_rewind
+                        .fetch_add(1, Ordering::Relaxed);
 
                     let mut step = false;
                     let presentation_pts = unsafe {
@@ -791,6 +821,7 @@ impl VideoThread {
                             .skip_frame(DiscardLevel::Default.into());
                     }
                     skip_to_ts = None;
+                    walk_serial = None;
 
                     let t_push = std::time::Instant::now();
                     if !self

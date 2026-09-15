@@ -883,6 +883,13 @@ impl SoftwareDecodeVideo {
         self.state.is_eof.load(Ordering::SeqCst)
     }
 
+    /// True when the read thread declared the stream terminal after
+    /// MAX_STALLED_REWINDS rewinds with zero decoded frames; terminal until
+    /// next successful seek.
+    pub fn is_fatal_eof(&self) -> bool {
+        self.state.fatal_eof.load(Ordering::Relaxed)
+    }
+
     pub fn pause(&self) {
         self.state
             .play_state
@@ -1011,6 +1018,18 @@ impl SoftwareDecodeVideo {
         let frame_rate = self.state.video_stream.load().metadata.framerate;
         let fallback_duration = frame_duration_seconds(f64::NAN, frame_rate);
         let mut frame_duration = fallback_duration;
+
+        // Terminal/EOF surface: with an empty queue and EOF reached there is
+        // nothing left to decode. On a looping stream the read thread rewinds
+        // (so keep per-frame pacing); if it failed (fatal_eof) or the stream
+        // is non-looping, park at a long wait instead of re-entering this
+        // empty poll forever at frame-duration cadence.
+        if next_frame.is_none() && self.state.is_eof.load(Ordering::SeqCst) {
+            let fatal = self.state.fatal_eof.load(Ordering::Relaxed);
+            if fatal || !self.state.looping.load(Ordering::SeqCst) {
+                return Ok((Duration::from_millis(100), false));
+            }
+        }
         while let Some(f) = next_frame {
             let current_serial = self
                 .state
