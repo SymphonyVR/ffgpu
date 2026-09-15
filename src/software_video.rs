@@ -42,17 +42,16 @@
 //! video).
 
 use crate::{
+    SeekMode,
     decode::{
-        self,
+        self, Clock, DecoderState, Frame, FrameQueue, PacketQueueMetadata,
         audio::{self, AudioSink, AudioStream, AudioThread},
         read::{Input, ReadMessage, ReadThread},
         video::{self, VideoStream},
-        Clock, DecoderState, Frame, FrameQueue, PacketQueueMetadata,
     },
     error::Result,
-    SeekMode,
 };
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 
 /// Public alias for the receiver side of the frame channel. Engine
 /// worker threads hold one of these and call `.recv()` to receive
@@ -135,7 +134,7 @@ impl RollingGap {
 use ffmpeg_next::{self as ffn, sys as ff};
 use std::{
     path::Path,
-    sync::{atomic::Ordering, Arc},
+    sync::{Arc, atomic::Ordering},
     thread::JoinHandle,
     time::Duration,
 };

@@ -61,7 +61,10 @@ fn probe_software_required_is_inverse() {
     let sw_req =
         ffgpu::probe_software_required(corpus_path("Test.mp4"), wgpu::Backend::BrowserWebGpu)
             .unwrap();
-    assert_eq!(hw_ok, !sw_req, "probe_software_required must be the inverse of probe_hardware_decoding_support");
+    assert_eq!(
+        hw_ok, !sw_req,
+        "probe_software_required must be the inverse of probe_hardware_decoding_support"
+    );
 }
 
 #[test]

@@ -842,6 +842,10 @@ impl VulkanVideoFrameAdapter {
         for i in 0..plane_count {
             let src_qf = vk_frame.queue_family[i];
             if src_qf != ash::vk::QUEUE_FAMILY_IGNORED && src_qf != graphics_queue_family {
+                eprintln!(
+                    "[VulkanVideo] qf mismatch: plane {} src_qf={} graphics={}",
+                    i, src_qf, graphics_queue_family
+                );
                 return Err(Error::UnsupportedBackend);
             }
         }
@@ -871,31 +875,20 @@ impl VulkanVideoFrameAdapter {
             let wait_info = ash::vk::SemaphoreWaitInfo::default()
                 .semaphores(&semaphores)
                 .values(&values);
-            unsafe { raw_device.wait_semaphores(&wait_info, u64::MAX) }
-                .map_err(|_| Error::UnsupportedBackend)?;
-        }
-
-        if self.copy_ctx.is_none() {
-            let hal_queue = unsafe {
-                queue
-                    .as_hal::<wgpu::hal::vulkan::Api>()
-                    .ok_or(Error::UnsupportedBackend)?
-            };
-            let copy_ctx = unsafe {
-                VulkanCopyContext::new(
-                    raw_device.clone(),
-                    (*hal_queue).as_raw(),
-                    graphics_queue_family,
-                )
+            if let Err(e) = unsafe { raw_device.wait_semaphores(&wait_info, u64::MAX) } {
+                eprintln!("[VulkanVideo] wait_semaphores failed: {:?}", e);
+                return Err(Error::UnsupportedBackend);
             }
-            .map_err(|_| Error::UnsupportedBackend)?;
-            self.copy_ctx = Some(copy_ctx);
         }
-        let copy_ctx = self.copy_ctx.as_mut().unwrap();
 
+        let mut transition_encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("ffgpu Vulkan Video zero-copy barrier"),
+            });
         unsafe {
-            copy_ctx
-                .submit_copy(|cmd_buffer| {
+            transition_encoder.as_hal_mut::<wgpu::hal::vulkan::Api, _, _>(|hal_encoder| {
+                if let Some(hal_encoder) = hal_encoder {
+                    let cmd_buffer = hal_encoder.raw_handle();
                     for i in 0..plane_count {
                         let aspect = if is_multiplane {
                             ash::vk::ImageAspectFlags::PLANE_0 | ash::vk::ImageAspectFlags::PLANE_1
@@ -927,9 +920,10 @@ impl VulkanVideoFrameAdapter {
                             std::slice::from_ref(&barrier),
                         );
                     }
-                })
-                .map_err(|_| Error::UnsupportedBackend)?;
+                }
+            });
         }
+        queue.submit(Some(transition_encoder.finish()));
         for i in 0..plane_count {
             vk_frame.layout[i] = ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
             vk_frame.access[i] = ash::vk::AccessFlags::SHADER_READ;
@@ -1616,7 +1610,7 @@ impl FrameAdapter for VulkanVideoFrameAdapter {
     }
 
     fn release_completed_frames(&mut self, device: &wgpu::Device) -> Result<()> {
-        if self.retired_zero_copy.is_empty() {
+        if self.retired_zero_copy.len() <= 2 {
             return Ok(());
         }
         let hal_device = unsafe {
@@ -1625,7 +1619,8 @@ impl FrameAdapter for VulkanVideoFrameAdapter {
                 .ok_or(Error::UnsupportedBackend)?
         };
         let raw_device = (*hal_device).raw_device();
-        for frame in self.retired_zero_copy.drain(..) {
+        while self.retired_zero_copy.len() > 2 {
+            let frame = self.retired_zero_copy.remove(0);
             unsafe { Self::release_zero_copy_frame(&frame._held_frame, &raw_device) };
         }
         Ok(())

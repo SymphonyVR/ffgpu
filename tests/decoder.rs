@@ -26,7 +26,10 @@ fn has_corpus() -> bool {
 fn discard_level_converts_to_ffmpeg_default() {
     use ffgpu::DiscardLevel;
     let level: ffmpeg_next::codec::discard::Discard = DiscardLevel::Default.into();
-    assert!(matches!(level, ffmpeg_next::codec::discard::Discard::Default));
+    assert!(matches!(
+        level,
+        ffmpeg_next::codec::discard::Discard::Default
+    ));
 }
 
 #[test]
@@ -53,14 +56,20 @@ fn discard_level_converts_to_ffmpeg_bidirectional() {
 fn discard_level_converts_to_ffmpeg_non_key() {
     use ffgpu::DiscardLevel;
     let level: ffmpeg_next::codec::discard::Discard = DiscardLevel::NonKey.into();
-    assert!(matches!(level, ffmpeg_next::codec::discard::Discard::NonKey));
+    assert!(matches!(
+        level,
+        ffmpeg_next::codec::discard::Discard::NonKey
+    ));
 }
 
 #[test]
 fn discard_level_converts_to_ffmpeg_non_intra() {
     use ffgpu::DiscardLevel;
     let level: ffmpeg_next::codec::discard::Discard = DiscardLevel::NonIntra.into();
-    assert!(matches!(level, ffmpeg_next::codec::discard::Discard::NonIntra));
+    assert!(matches!(
+        level,
+        ffmpeg_next::codec::discard::Discard::NonIntra
+    ));
 }
 
 #[test]

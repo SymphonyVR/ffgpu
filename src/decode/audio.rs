@@ -481,6 +481,29 @@ pub struct AudioSink {
     preview_armed: Arc<std::sync::atomic::AtomicBool>,
 }
 
+fn should_mute_device_audio() -> bool {
+    if std::env::var("NEXA_MUTE_AUDIO")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+        || std::env::var("NEXA_TEST_MUTE_AUDIO")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    {
+        return true;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let s = exe.to_string_lossy().to_lowercase();
+        if s.contains("target\\debug\\deps")
+            || s.contains("target/debug/deps")
+            || s.contains("target\\release\\deps")
+            || s.contains("target/release/deps")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn initial_audio_parameters() -> AudioParameters {
     #[cfg(feature = "cpal")]
     {
@@ -753,24 +776,34 @@ impl AudioSink {
 
     /// Convert this `AudioSink` into a device-backed, self-healing `DeviceAudioSink`.
     ///
-    /// - Wraps the ring-buffer consumer in `Arc<Mutex<…>>` so CPAL stream callbacks
-    ///   can be recreated without touching the producer thread.
-    /// - Spawns a background monitor that detects default-device changes via both
-    ///   native OS notifications and a CPAL name-comparison fallback.
-    /// - On device change or stream error: flushes stale samples, sends
-    ///   `Message::UpdateParameters` to the FFmpeg SWR resampler, and rebuilds
-    ///   the CPAL stream — zero producer-side interruption.
+    /// In test environments (cargo test / NEXA_MUTE_AUDIO), gain defaults to 0.0
+    /// to avoid emitting audio to OS speakers. Production playback uses unity gain (1.0).
     #[cfg(feature = "cpal")]
     pub fn into_device_sink(self) -> DeviceAudioSink {
+        let initial_gain = if should_mute_device_audio() { 0.0 } else { 1.0 };
+        self.into_device_sink_with_gain(initial_gain)
+    }
+
+    /// Convert this `AudioSink` into an explicitly muted `DeviceAudioSink` (gain 0.0).
+    /// Safe for tests: clock and A/V sync advance identically, but no audio reaches OS speakers.
+    #[cfg(feature = "cpal")]
+    pub fn into_device_sink_muted(self) -> DeviceAudioSink {
+        self.into_device_sink_with_gain(0.0)
+    }
+
+    /// Convert this `AudioSink` into a `DeviceAudioSink` with the specified initial gain.
+    #[cfg(feature = "cpal")]
+    pub fn into_device_sink_with_gain(self, initial_gain: f32) -> DeviceAudioSink {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
         use std::sync::Mutex;
         use std::sync::atomic::AtomicBool;
 
         // Wrap the consumer so multiple stream generations can share it.
         let consumer = Arc::new(Mutex::new(self.consumer));
-        let gain = Arc::new(AtomicF32::new(1.0));
+        let gain = Arc::new(AtomicF32::new(initial_gain.max(0.0)));
         let alive = Arc::new(AtomicBool::new(false));
         let stream = Arc::new(Mutex::new(None::<cpal::Stream>));
+        let stop = Arc::new(AtomicBool::new(false));
 
         // Build the initial CPAL stream.
         match build_cpal_stream(
@@ -792,14 +825,64 @@ impl AudioSink {
                 *stream.lock().unwrap() = Some(s);
                 alive.store(true, Ordering::Relaxed);
             }
-            Err(e) => log::error!("[Audio] Failed to build initial CPAL stream: {}", e),
+            Err(e) => {
+                log::warn!(
+                    "[Audio] CPAL stream unavailable ({e}); using silent virtual clock driver"
+                );
+                // Silent fallback ticker: drains audio at real-time rate so clock advances without sound hardware.
+                let fallback_stop = stop.clone();
+                let fallback_state = self.state.clone();
+                let fallback_consumer = consumer.clone();
+                let fallback_gain = gain.clone();
+                let fallback_clock = self.clock.clone();
+                let fallback_last_serial = self.last_serial.clone();
+                let fallback_read_count = self.read_count.clone();
+                let fallback_anchor = self.anchor.clone();
+                let fallback_required_serial = self.required_serial.clone();
+                let fallback_preview_samples = self.preview_samples.clone();
+                let fallback_preview_armed = self.preview_armed.clone();
+                let target_rate = 48_000 * 2;
+                std::thread::spawn(move || {
+                    let mut out = [0.0f32; 480];
+                    while !fallback_stop.load(Ordering::Relaxed)
+                        && fallback_state.alive.load(Ordering::Relaxed)
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                        let play_state = fallback_state.play_state();
+                        let current_serial = fallback_state
+                            .audio_stream
+                            .load()
+                            .packets
+                            .metadata
+                            .serial
+                            .load(Ordering::Relaxed);
+                        if let Ok(mut cons) = fallback_consumer.lock() {
+                            pump_output(
+                                &mut out,
+                                fallback_gain.load(Ordering::Relaxed),
+                                play_state,
+                                current_serial,
+                                &mut cons,
+                                &fallback_clock,
+                                &fallback_last_serial,
+                                &fallback_read_count,
+                                &fallback_anchor,
+                                &fallback_required_serial,
+                                &fallback_preview_samples,
+                                &fallback_preview_armed,
+                                target_rate,
+                            );
+                        }
+                    }
+                });
+                alive.store(true, Ordering::Relaxed);
+            }
         }
 
         // Kick off the native OS device monitor (one global thread per process).
         super::device_monitor::start_device_monitor();
 
         // ── monitor thread ────────────────────────────────────────────────────
-        let stop = Arc::new(AtomicBool::new(false));
         let stop_c = stop.clone();
         let stream_c = stream.clone();
         let alive_c = alive.clone();

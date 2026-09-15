@@ -1,14 +1,15 @@
 use crate::{
     context::pipeline_cache::PipelineCache,
     decode::{
+        Clock, DecoderState, Frame, FrameQueue, PlayState,
         audio::{self, AudioSink, AudioThread},
         frames, packet_queue,
         read::{Input, ReadMessage, ReadThread},
-        sink_thread, video, Clock, DecoderState, Frame, FrameQueue, PlayState,
+        sink_thread, video,
     },
     error::{Error, Result},
 };
-use crossbeam_channel::{unbounded, Sender};
+use crossbeam_channel::{Sender, unbounded};
 use ffmpeg_next::{self as ffn, sys as ff};
 use std::ptr::NonNull;
 use std::sync::Mutex;
@@ -16,8 +17,8 @@ use std::{
     ops::Add,
     path::Path,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     thread::JoinHandle,
     time::Duration,
@@ -587,7 +588,8 @@ impl Video {
                     }
                     FrameResponse::Retry => {
                         if frame.serial == current_serial {
-                            self.last_pts = unsafe { (*frame.frame.as_ptr()).best_effort_timestamp };
+                            self.last_pts =
+                                unsafe { (*frame.frame.as_ptr()).best_effort_timestamp };
                             self.last_serial = frame.serial;
                         }
                         video_frame_queue.release(frame);

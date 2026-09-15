@@ -1216,7 +1216,8 @@ mod win {
         /// Persistent GL texture names (target = GL_TEXTURE_2D); backed by
         /// the imported memory objects. The wgpu `Texture` is created once
         /// from this name and never re-wrapped.
-        #[allow(dead_code)] // GL names kept for debugging/interop; draws go through the views
+        #[allow(dead_code)]
+        // GL names kept for debugging/interop; draws go through the views
         y_gl: gl::types::GLuint,
         #[allow(dead_code)]
         uv_gl: gl::types::GLuint,
@@ -1903,14 +1904,23 @@ mod win {
                     .position(|s| s.state == MemoryObjectSlotState::Free);
 
                 if slot_idx.is_none() {
-                    if let Some(pos) = self.slots.iter().position(|s| s.state == MemoryObjectSlotState::Submitted && s.fence.is_some()) {
+                    if let Some(pos) = self.slots.iter().position(|s| {
+                        s.state == MemoryObjectSlotState::Submitted && s.fence.is_some()
+                    }) {
                         let hal = self.device.as_hal::<wgpu::hal::gles::Api>();
                         if let Some(hal) = hal {
                             let _gl_guard = hal.context().lock();
                             let slot = &mut self.slots[pos];
                             if let Some(fence) = slot.fence {
-                                let status = gl::ClientWaitSync(fence, gl::SYNC_FLUSH_COMMANDS_BIT, 33_000_000);
-                                if status == gl::ALREADY_SIGNALED || status == gl::CONDITION_SATISFIED || status == gl::WAIT_FAILED {
+                                let status = gl::ClientWaitSync(
+                                    fence,
+                                    gl::SYNC_FLUSH_COMMANDS_BIT,
+                                    33_000_000,
+                                );
+                                if status == gl::ALREADY_SIGNALED
+                                    || status == gl::CONDITION_SATISFIED
+                                    || status == gl::WAIT_FAILED
+                                {
                                     let _ = (self.ext.release_keyed_mutex)(slot.y_mem, 0);
                                     let _ = (self.ext.release_keyed_mutex)(slot.uv_mem, 0);
                                     gl::DeleteSync(fence);
@@ -2088,7 +2098,9 @@ mod win {
                     let status = gl::ClientWaitSync(fence, gl::SYNC_FLUSH_COMMANDS_BIT, 0);
                     if status != gl::ALREADY_SIGNALED && status != gl::CONDITION_SATISFIED {
                         if status == gl::WAIT_FAILED {
-                            eprintln!("[opengl] memory-object: glClientWaitSync returned WAIT_FAILED");
+                            eprintln!(
+                                "[opengl] memory-object: glClientWaitSync returned WAIT_FAILED"
+                            );
                             let _ = (self.ext.release_keyed_mutex)(slot.y_mem, 0);
                             let _ = (self.ext.release_keyed_mutex)(slot.uv_mem, 0);
                             gl::DeleteSync(fence);
@@ -2663,7 +2675,10 @@ mod win {
                 for slot in self.slots.iter_mut() {
                     if let (WglSlotState::Submitted, Some(fence)) = (slot.state, slot.fence) {
                         let status = gl::ClientWaitSync(fence, gl::SYNC_FLUSH_COMMANDS_BIT, 0);
-                        if status == gl::ALREADY_SIGNALED || status == gl::CONDITION_SATISFIED || status == gl::WAIT_FAILED {
+                        if status == gl::ALREADY_SIGNALED
+                            || status == gl::CONDITION_SATISFIED
+                            || status == gl::WAIT_FAILED
+                        {
                             gl::DeleteSync(fence);
                             slot.fence = None;
                             Self::unlock_slot(&self.wgl, self.dx_device, slot);
@@ -2710,14 +2725,25 @@ mod win {
                     .position(|s| s.state == WglSlotState::Free);
 
                 if slot_idx.is_none() {
-                    if let Some(pos) = self.slots.iter().position(|s| s.state == WglSlotState::Submitted && s.fence.is_some()) {
+                    if let Some(pos) = self
+                        .slots
+                        .iter()
+                        .position(|s| s.state == WglSlotState::Submitted && s.fence.is_some())
+                    {
                         let hal = self.device.as_hal::<wgpu::hal::gles::Api>();
                         if let Some(hal) = hal {
                             let _gl_guard = hal.context().lock();
                             let slot = &mut self.slots[pos];
                             if let Some(fence) = slot.fence {
-                                let status = gl::ClientWaitSync(fence, gl::SYNC_FLUSH_COMMANDS_BIT, 33_000_000);
-                                if status == gl::ALREADY_SIGNALED || status == gl::CONDITION_SATISFIED || status == gl::WAIT_FAILED {
+                                let status = gl::ClientWaitSync(
+                                    fence,
+                                    gl::SYNC_FLUSH_COMMANDS_BIT,
+                                    33_000_000,
+                                );
+                                if status == gl::ALREADY_SIGNALED
+                                    || status == gl::CONDITION_SATISFIED
+                                    || status == gl::WAIT_FAILED
+                                {
                                     gl::DeleteSync(fence);
                                     slot.fence = None;
                                     Self::unlock_slot(&self.wgl, self.dx_device, slot);

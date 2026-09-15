@@ -20,14 +20,21 @@ fn seek_and_resume(input: &mut ffmpeg_next::format::context::Input, ts: i64, n_b
             Ok(_) => {
                 n_after += 1;
                 if n_after <= 6 {
-                    eprintln!("[RAW] ({n_before}?) post-seek pkt stream={} pts_ms={:?}", packet.stream(), packet.pts());
+                    eprintln!(
+                        "[RAW] ({n_before}?) post-seek pkt stream={} pts_ms={:?}",
+                        packet.stream(),
+                        packet.pts()
+                    );
                 }
                 if n_after >= 100 {
                     break;
                 }
             }
             Err(e) => {
-                eprintln!("[RAW] post-seek EOF at n={n_after} after {:?}: {e}", t0.elapsed());
+                eprintln!(
+                    "[RAW] post-seek EOF at n={n_after} after {:?}: {e}",
+                    t0.elapsed()
+                );
                 break;
             }
         }
@@ -36,6 +43,7 @@ fn seek_and_resume(input: &mut ffmpeg_next::format::context::Input, ts: i64, n_b
 }
 
 #[test]
+#[ignore = "slow raw packet seek probe (reads entire file to EOF)"]
 fn probe_raw_seek_eof() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let path = std::path::PathBuf::from(manifest_dir)

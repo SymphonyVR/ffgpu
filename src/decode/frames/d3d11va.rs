@@ -8,11 +8,11 @@ use crate::{
 use ffmpeg_next::{self as ffn, sys as ff};
 use std::{ffi::c_void, mem::ManuallyDrop, ptr::NonNull};
 use windows::{
-    core::Interface,
     Win32::{
         Foundation::HANDLE,
         Graphics::{Direct3D11 as D3D11, Direct3D12 as D3D12, Dxgi},
     },
+    core::Interface,
 };
 
 // see libavutil/hwcontext_d3d11va.h

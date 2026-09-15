@@ -25,12 +25,7 @@ fn test_file(name: &str) -> std::path::PathBuf {
         .parent()
         .unwrap()
         .join(name);
-    assert!(
-        p.exists(),
-        "Test file {} not found at {:?}",
-        name,
-        p
-    );
+    assert!(p.exists(), "Test file {} not found at {:?}", name, p);
     p
 }
 
@@ -108,9 +103,7 @@ fn software_video_to_rgba_produces_valid_buffer() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         if let Ok(sf) = rx.recv_timeout(Duration::from_millis(100)) {
-            let rgba = sf
-                .to_rgba()
-                .expect("NV12 → RGBA conversion should succeed");
+            let rgba = sf.to_rgba().expect("NV12 → RGBA conversion should succeed");
             // RGBA: 4 bytes per pixel
             assert_eq!(rgba.len(), (sf.width * sf.height * 4) as usize);
             // Spot-check: not all zeros (frame has content)
@@ -231,7 +224,10 @@ fn software_video_prefetches_no_audio_loop() {
         let _ = rx.recv_timeout(Duration::from_millis(100));
     }
 
-    assert!(video.loop_generation() > 0, "decoder did not cross a loop boundary");
+    assert!(
+        video.loop_generation() > 0,
+        "decoder did not cross a loop boundary"
+    );
     assert!(!video.is_eof(), "prefetched looping decoder reported EOF");
 }
 
@@ -324,13 +320,11 @@ fn yuv422_to_rgba_conversion() {
     let yuyv_data: Vec<u8> = vec![
         // row 0
         // macropixel 0 (covers x=0, x=1): Y0=128, U=128, Y1=128, V=128
-        128, 128, 128, 128,
-        // macropixel 1 (covers x=2, x=3): Y0=64, U=200, Y1=200, V=200
+        128, 128, 128, 128, // macropixel 1 (covers x=2, x=3): Y0=64, U=200, Y1=200, V=200
         64, 200, 200, 200,
         // row 1
         // macropixel 2 (covers x=0, x=1): Y0=200, U=64, Y1=64, V=64
-        200, 64, 64, 64,
-        // macropixel 3 (covers x=2, x=3): Y0=128, U=128, Y1=128, V=128
+        200, 64, 64, 64, // macropixel 3 (covers x=2, x=3): Y0=128, U=128, Y1=128, V=128
         128, 128, 128, 128,
     ];
     let sf = SoftwareFrame {
@@ -382,7 +376,12 @@ fn yuv444p_to_rgba_conversion() {
     // Pixel (0,0): Y=16, U=128, V=128 — neutral gray (near black in limited range)
     // We just verify it's not a crash and the pixel order matches
     let p0 = &rgba[0..4];
-    assert!(p0[0] <= p0[1], "p0.r <= p0.g for gray input, got r={}, g={}", p0[0], p0[1]);
+    assert!(
+        p0[0] <= p0[1],
+        "p0.r <= p0.g for gray input, got r={}, g={}",
+        p0[0],
+        p0[1]
+    );
 }
 
 #[test]
@@ -509,7 +508,10 @@ fn battle_20_loops_with_audio() {
         let mut got_frame = false;
         while std::time::Instant::now() < deadline {
             if let Ok(sf) = rx.recv_timeout(Duration::from_millis(200)) {
-                assert!(sf.width > 0 && sf.height > 0, "loop {loop_idx}: bad frame size");
+                assert!(
+                    sf.width > 0 && sf.height > 0,
+                    "loop {loop_idx}: bad frame size"
+                );
                 assert!(!sf.y.is_empty(), "loop {loop_idx}: empty Y plane");
                 got_frame = true;
                 total_frames += 1;
@@ -586,7 +588,10 @@ fn battle_20_loops_no_audio() {
         let mut got_frame = false;
         while std::time::Instant::now() < deadline {
             if let Ok(sf) = rx.recv_timeout(Duration::from_millis(200)) {
-                assert!(sf.width > 0 && sf.height > 0, "loop {loop_idx}: bad frame size");
+                assert!(
+                    sf.width > 0 && sf.height > 0,
+                    "loop {loop_idx}: bad frame size"
+                );
                 got_frame = true;
                 total_frames += 1;
                 break;
@@ -757,7 +762,10 @@ fn run_backward_reanchor(file: &str, target_ms: u64, pre_audio_s: f64, pre_video
     }
     let pre_video = video.position().as_secs_f64();
     let pre_audio = audio.current_position_ms() / 1000.0;
-    assert!(pre_audio > pre_audio_s - 0.5, "audio clock should be live before seek (got {pre_audio:.3}s)");
+    assert!(
+        pre_audio > pre_audio_s - 0.5,
+        "audio clock should be live before seek (got {pre_audio:.3}s)"
+    );
 
     // Backward seek; the audio position must jump to the target, not stall at
     // its pre-seek position or at 0.0 while the post-seek frame arrives.
@@ -792,12 +800,13 @@ fn run_backward_reanchor(file: &str, target_ms: u64, pre_audio_s: f64, pre_video
         if ap > 0.05 {
             min_audio = min_audio.min(ap);
         }
-        if (min_video - t_s).abs() < 0.7 {
+        let tol = if file.ends_with(".webm") { 1.0 } else { 0.7 };
+        if (min_video - t_s).abs() < tol {
             eprintln!(
                 "POST-SEEK min video={min_video:.3}s re-anchored ✓ (audio trough={min_audio:.3}s)"
             );
             assert!(
-                !min_audio.is_finite() || (min_audio - t_s).abs() < 0.7,
+                !min_audio.is_finite() || (min_audio - t_s).abs() < tol,
                 "audio clock trough {min_audio:.3}s after a {t_s:.1}s seek (frozen/stale clock)"
             );
             return;

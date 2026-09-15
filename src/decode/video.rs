@@ -731,7 +731,9 @@ impl VideoThread {
                             eprintln!("[VideoThread] receive_frame EOF");
                         }
                         if skip_to_ts.is_some() {
-                            self.decoder.decoder.skip_frame(DiscardLevel::Default.into());
+                            self.decoder
+                                .decoder
+                                .skip_frame(DiscardLevel::Default.into());
                         }
                         if let Some(mut prev_frame) = prev_frame.take() {
                             unsafe {
@@ -784,7 +786,9 @@ impl VideoThread {
                     if skip_to_ts.is_some() {
                         // First frame at/after the accurate-seek target: the
                         // walk is complete, restore full decode for playback.
-                        self.decoder.decoder.skip_frame(DiscardLevel::Default.into());
+                        self.decoder
+                            .decoder
+                            .skip_frame(DiscardLevel::Default.into());
                     }
                     skip_to_ts = None;
 
