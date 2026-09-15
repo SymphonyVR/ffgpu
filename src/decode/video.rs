@@ -836,12 +836,25 @@ impl VideoThread {
                     t_push_sum += push_us;
                     frame_count += 1;
                     if frame_count >= 30 {
-                        let avg_recv = t_recv_sum as f64 / frame_count as f64 / 1000.0;
-                        let avg_push = t_push_sum as f64 / frame_count as f64 / 1000.0;
-                        eprintln!(
-                            "[VideoThread] Pipe avg ({} frames): recv_frame={:.2}ms push={:.2}ms",
-                            frame_count, avg_recv, avg_push
-                        );
+                        // Rate-limit DIAG output to one line per 2s per
+                        // process: a corrupt burst must not serialize the
+                        // decoder threads on stderr/conhost writes.
+                        static LAST_PIPE_DIAG_MS: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        if now_ms.saturating_sub(LAST_PIPE_DIAG_MS.load(Ordering::Relaxed)) >= 2000
+                        {
+                            let avg_recv = t_recv_sum as f64 / frame_count as f64 / 1000.0;
+                            let avg_push = t_push_sum as f64 / frame_count as f64 / 1000.0;
+                            eprintln!(
+                                "[VideoThread] Pipe avg ({} frames): recv_frame={:.2}ms push={:.2}ms",
+                                frame_count, avg_recv, avg_push
+                            );
+                            LAST_PIPE_DIAG_MS.store(now_ms, Ordering::Relaxed);
+                        }
                         t_recv_sum = 0;
                         t_push_sum = 0;
                         frame_count = 0;

@@ -90,6 +90,7 @@ impl DecoderState {
     /// the final construction after decoders are wired up. The `alive`
     /// flag is freshly initialized.
     pub fn new(metadata: Metadata, video: VideoStream, audio: AudioStream) -> Self {
+        avlog::install();
         DecoderState {
             metadata: ArcSwap::new(Arc::new(metadata)),
 
@@ -118,6 +119,7 @@ impl DecoderState {
     /// caller MUST follow up with `set_metadata` + `set_streams` before
     /// spawning any threads.
     pub fn empty() -> Self {
+        avlog::install();
         DecoderState {
             metadata: ArcSwap::new(Arc::new(Metadata {
                 duration: Duration::ZERO,
@@ -549,6 +551,149 @@ pub(crate) fn container_start_seconds(state: &DecoderState) -> f64 {
         start as f64 / ff::AV_TIME_BASE as f64
     } else {
         0.0
+    }
+}
+
+/// Rate-limiting router for FFmpeg's `av_log` output.
+///
+/// FFmpeg's default callback writes every decoder complaint
+/// (`Invalid NAL unit size`, `channel element duplicate`, ...) straight to
+/// stderr. A corrupt loop can emit thousands of these per second and the
+/// resulting stderr serialization then starves the other decoder threads.
+/// This callback routes messages into the `log` crate instead: the first
+/// few occurrences of each (level, item tag, message) triple are forwarded
+/// verbatim, repeats are coalesced into a periodic suppression summary, and
+/// idle keys expire so seeks/loops naturally reset the limiter.
+mod avlog {
+    use super::ff;
+    use std::collections::HashMap;
+    use std::os::raw::{c_char, c_int, c_void};
+    use std::sync::{Mutex, Once};
+    use std::time::{Duration, Instant};
+
+    /// Occurrences of one (level, item, message) key forwarded verbatim.
+    const VERBATIM: u64 = 3;
+    /// After this many suppressed repeats, emit one summary and reset.
+    const SUMMARY_EVERY: u64 = 50;
+    /// A key idle for longer than this is dropped, which resets its limit.
+    const KEY_IDLE: Duration = Duration::from_secs(30);
+    /// Truncation bound for the message text used in a dedup key.
+    const KEY_MSG_LEN: usize = 128;
+
+    struct Entry {
+        total: u64,
+        suppressed: u64,
+        last: Instant,
+    }
+
+    // Cited in the AV_LOG_* comparisons; the map key tuple on its own is
+    // complex enough to trip clippy::type_complexity, so name it.
+    type LimiterKey = (c_int, usize, String);
+    type LimiterMap = HashMap<LimiterKey, Entry>;
+
+    static LIMITER: Mutex<Option<LimiterMap>> = Mutex::new(None);
+    static INSTALL: Once = Once::new();
+
+    /// Install the routing callback. Idempotent; safe to call from every
+    /// decoder construction path.
+    pub(crate) fn install() {
+        INSTALL.call_once(|| unsafe {
+            // SAFETY: installs a process-global FFmpeg callback; the `Once`
+            // guarantees this is executed exactly once, and the callback it
+            // points to is 'static and only touches its own static state.
+            ff::av_log_set_callback(Some(callback));
+        });
+    }
+
+    fn log_level(level: c_int) -> log::Level {
+        if level <= ff::AV_LOG_ERROR as c_int {
+            log::Level::Error
+        } else if level <= ff::AV_LOG_WARNING as c_int {
+            log::Level::Warn
+        } else if level <= ff::AV_LOG_INFO as c_int {
+            log::Level::Info
+        } else if level <= ff::AV_LOG_VERBOSE as c_int {
+            log::Level::Debug
+        } else {
+            log::Level::Trace
+        }
+    }
+
+    unsafe extern "C" fn callback(avcl: *mut c_void, level: c_int, fmt: *const c_char, vl: ff::va_list) {
+        let mut buf = [0 as c_char; 1024];
+        let mut print_prefix: c_int = 1;
+        // SAFETY: `av_log_format_line` is the documented way to reproduce the
+        // default callback's formatting from the (item, level, fmt, va_list)
+        // tuple handed to an av_log callback. `avcl`/`fmt`/`vl` are valid for
+        // the duration of the call and are only read; the va_list is passed
+        // through without advancing it here.
+        unsafe {
+            ff::av_log_format_line(
+                avcl,
+                level,
+                fmt,
+                vl,
+                buf.as_mut_ptr(),
+                buf.len() as c_int,
+                &mut print_prefix,
+            );
+        }
+        // SAFETY: av_log_format_line NUL-terminates `buf`.
+        let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+        let line = cstr.to_string_lossy();
+        let line = line.trim_end();
+
+        let lvl = log_level(level);
+        // Fatal messages are never suppressed.
+        if level <= ff::AV_LOG_FATAL as c_int {
+            log::log!(lvl, "{}", line);
+            return;
+        }
+
+        // Keyed by (level, item pointer tag, truncated message). The item
+        // pointer is a heuristic tag: FFmpeg may reuse an address for a new
+        // context, but the message text then also enters the key.
+        let truncated: String = line.chars().take(KEY_MSG_LEN).collect();
+        let key = (level, avcl as usize, truncated);
+        let now = Instant::now();
+        let mut emit: Option<(log::Level, String, u64)> = None;
+        {
+            let mut guard = LIMITER.lock().unwrap();
+            let map = guard.get_or_insert_with(HashMap::new);
+            if map.len() > 64 {
+                map.retain(|_, e| now.duration_since(e.last) < KEY_IDLE);
+            }
+            match map.get_mut(&key) {
+                Some(e) if now.duration_since(e.last) >= KEY_IDLE => {
+                    *e = Entry { total: 1, suppressed: 0, last: now };
+                    emit = Some((lvl, key.2.clone(), 0));
+                }
+                Some(e) => {
+                    e.total += 1;
+                    e.last = now;
+                    if e.total <= VERBATIM {
+                        emit = Some((lvl, key.2.clone(), 0));
+                    } else {
+                        e.suppressed += 1;
+                        if e.suppressed >= SUMMARY_EVERY {
+                            let n = std::mem::take(&mut e.suppressed);
+                            emit = Some((log::Level::Warn, key.2.clone(), n));
+                        }
+                    }
+                }
+                None => {
+                    map.insert(key.clone(), Entry { total: 1, suppressed: 0, last: now });
+                    emit = Some((lvl, key.2, 0));
+                }
+            }
+        }
+        if let Some((lvl, msg, n)) = emit {
+            if n > 0 {
+                log::log!(lvl, "av_log suppressed {} repeats (last: {})", n, msg);
+            } else {
+                log::log!(lvl, "{}", msg);
+            }
+        }
     }
 }
 
