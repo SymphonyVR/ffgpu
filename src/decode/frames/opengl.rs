@@ -1266,12 +1266,133 @@ mod win {
     /// Both the WGL and the memory-object interop strategies use the same
     /// core: only the per-slot ownership of the R8/RG8 output differs.
     struct PlaneCopyCore {
-        #[allow(dead_code)] // held to keep the D3D11 device alive as long as the core
         device: D3D11::ID3D11Device,
         context: D3D11::ID3D11DeviceContext,
         pipeline: PlaneCopyPipeline,
         srv_y: D3D11::ID3D11ShaderResourceView,
         srv_uv: D3D11::ID3D11ShaderResourceView,
+        /// (decoder-pool texture pointer, array slice) the current SRV pair
+        /// samples. FFmpeg's D3D11VA output pool is a texture *array* and
+        /// hands each decoded frame its own slice (`AVFrame.data[1]`); the
+        /// SRVs are created once at adapter init and re-pointed lazily
+        /// whenever the incoming frame's pointer/slice changes. Without this,
+        /// the plane copy keeps reading the slice the FIRST frame landed on
+        /// and the screen mostly shows that stale slice (the "GL frozen while
+        /// decode counters advance" class of failure).
+        srv_source: (usize, u32),
+    }
+
+    impl PlaneCopyCore {
+        /// Re-point the plane-copy SRVs at the current frame's decoder-pool
+        /// slice. Steady state is a single tuple compare; rebuild happens only
+        /// when the decoder hands out a different pool texture or slice.
+        unsafe fn ensure_srv_source(
+            &mut self,
+            decoder_texture_ptr: *mut std::ffi::c_void,
+            array_slice: u32,
+        ) -> Result<()> {
+            if self.srv_source == (decoder_texture_ptr as usize, array_slice) {
+                return Ok(());
+            }
+            if decoder_texture_ptr.is_null() {
+                return Err(Error::InvalidFrame);
+            }
+            // SAFETY: the pointer is the `AVFrame.data[0]` handed to us by
+            // ffmpeg's D3D11VA hwaccel, a valid ID3D11Texture2D borrow for the
+            // frame's lifetime. ManuallyDrop suppresses the Release that an
+            // owning `transmute` would run at scope end.
+            let decoder_texture = std::mem::ManuallyDrop::new(std::mem::transmute::<
+                *mut std::ffi::c_void,
+                D3D11::ID3D11Texture2D,
+            >(decoder_texture_ptr));
+            let (srv_y, srv_uv) = create_plane_srvs(&self.device, &decoder_texture, array_slice)?;
+            self.srv_y = srv_y;
+            self.srv_uv = srv_uv;
+            self.srv_source = (decoder_texture_ptr as usize, array_slice);
+            Ok(())
+        }
+    }
+
+    /// Create the Y (R8) and UV (RG8) SRVs viewing ONE slice of the decoder's
+    /// NV12 output texture array. Called once at init and again whenever the
+    /// decoder presents a frame on a different pool slice.
+    ///
+    /// SAFETY: `d3d11_device` must be the device that created
+    /// `decoder_texture`; both must outlive the returned views.
+    unsafe fn create_plane_srvs(
+        d3d11_device: &D3D11::ID3D11Device,
+        decoder_texture: &D3D11::ID3D11Texture2D,
+        array_slice: u32,
+    ) -> Result<(D3D11::ID3D11ShaderResourceView, D3D11::ID3D11ShaderResourceView)> {
+        unsafe {
+            let mut tex_desc = D3D11::D3D11_TEXTURE2D_DESC::default();
+            decoder_texture.GetDesc(&mut tex_desc);
+            if tex_desc.Format != Dxgi::Common::DXGI_FORMAT_NV12 {
+                eprintln!(
+                    "[opengl] native WGL interop supports NV12 only, got {:?}",
+                    tex_desc.Format
+                );
+                return Err(Error::UnsupportedPixelFormat);
+            }
+            if array_slice >= tex_desc.ArraySize {
+                eprintln!(
+                    "[opengl] decoder array slice {} is outside array size {}",
+                    array_slice, tex_desc.ArraySize
+                );
+                return Err(Error::InvalidFrame);
+            }
+            let srv_desc_y = D3D11::D3D11_SHADER_RESOURCE_VIEW_DESC {
+                Format: Dxgi::Common::DXGI_FORMAT_R8_UNORM,
+                ViewDimension: Direct3D::D3D11_SRV_DIMENSION_TEXTURE2DARRAY,
+                Anonymous: D3D11::D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2DArray: D3D11::D3D11_TEX2D_ARRAY_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: tex_desc.MipLevels,
+                        FirstArraySlice: array_slice,
+                        ArraySize: 1,
+                    },
+                },
+            };
+            let mut srv_y = None;
+            d3d11_device
+                .CreateShaderResourceView(decoder_texture, Some(&srv_desc_y), Some(&mut srv_y))
+                .map_err(|e| {
+                    eprintln!("[opengl] CreateShaderResourceView(Y) FAILED: {:?}", e);
+                    Error::TextureShare
+                })?;
+            let srv_y = srv_y.ok_or_else(|| {
+                eprintln!("[opengl] CreateShaderResourceView(Y) returned null SRV");
+                Error::TextureShare
+            })?;
+            let srv_desc_uv = D3D11::D3D11_SHADER_RESOURCE_VIEW_DESC {
+                Format: Dxgi::Common::DXGI_FORMAT_R8G8_UNORM,
+                ViewDimension: Direct3D::D3D11_SRV_DIMENSION_TEXTURE2DARRAY,
+                Anonymous: D3D11::D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2DArray: D3D11::D3D11_TEX2D_ARRAY_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: tex_desc.MipLevels,
+                        FirstArraySlice: array_slice,
+                        ArraySize: 1,
+                    },
+                },
+            };
+            let mut srv_uv = None;
+            d3d11_device
+                .CreateShaderResourceView(
+                    decoder_texture,
+                    Some(&srv_desc_uv),
+                    Some(&mut srv_uv),
+                )
+                .map_err(|e| {
+                    eprintln!("[opengl] CreateShaderResourceView(UV) FAILED: {:?}", e);
+                    Error::TextureShare
+                })?;
+            let srv_uv = srv_uv.ok_or_else(|| {
+                eprintln!("[opengl] CreateShaderResourceView(UV) returned null SRV");
+                Error::TextureShare
+            })?;
+            Ok((srv_y, srv_uv))
+        }
     }
 
     impl PlaneCopyCore {
@@ -1328,56 +1449,7 @@ mod win {
                     );
                     return Err(Error::TextureShare);
                 }
-                let srv_desc_y = D3D11::D3D11_SHADER_RESOURCE_VIEW_DESC {
-                    Format: Dxgi::Common::DXGI_FORMAT_R8_UNORM,
-                    ViewDimension: Direct3D::D3D11_SRV_DIMENSION_TEXTURE2DARRAY,
-                    Anonymous: D3D11::D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
-                        Texture2DArray: D3D11::D3D11_TEX2D_ARRAY_SRV {
-                            MostDetailedMip: 0,
-                            MipLevels: tex_desc.MipLevels,
-                            FirstArraySlice: array_slice,
-                            ArraySize: 1,
-                        },
-                    },
-                };
-                let mut srv_y = None;
-                d3d11_device
-                    .CreateShaderResourceView(decoder_texture, Some(&srv_desc_y), Some(&mut srv_y))
-                    .map_err(|e| {
-                        eprintln!("[opengl] CreateShaderResourceView(Y) FAILED: {:?}", e);
-                        Error::TextureShare
-                    })?;
-                let srv_y = srv_y.ok_or_else(|| {
-                    eprintln!("[opengl] CreateShaderResourceView(Y) returned null SRV");
-                    Error::TextureShare
-                })?;
-                let srv_desc_uv = D3D11::D3D11_SHADER_RESOURCE_VIEW_DESC {
-                    Format: Dxgi::Common::DXGI_FORMAT_R8G8_UNORM,
-                    ViewDimension: Direct3D::D3D11_SRV_DIMENSION_TEXTURE2DARRAY,
-                    Anonymous: D3D11::D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
-                        Texture2DArray: D3D11::D3D11_TEX2D_ARRAY_SRV {
-                            MostDetailedMip: 0,
-                            MipLevels: tex_desc.MipLevels,
-                            FirstArraySlice: array_slice,
-                            ArraySize: 1,
-                        },
-                    },
-                };
-                let mut srv_uv = None;
-                d3d11_device
-                    .CreateShaderResourceView(
-                        decoder_texture,
-                        Some(&srv_desc_uv),
-                        Some(&mut srv_uv),
-                    )
-                    .map_err(|e| {
-                        eprintln!("[opengl] CreateShaderResourceView(UV) FAILED: {:?}", e);
-                        Error::TextureShare
-                    })?;
-                let srv_uv = srv_uv.ok_or_else(|| {
-                    eprintln!("[opengl] CreateShaderResourceView(UV) returned null SRV");
-                    Error::TextureShare
-                })?;
+                let (srv_y, srv_uv) = create_plane_srvs(d3d11_device, decoder_texture, array_slice)?;
                 eprintln!(
                     "[opengl] Y/UV SRVs created OK (array_slice={})",
                     array_slice
@@ -1398,6 +1470,7 @@ mod win {
                     pipeline,
                     srv_y,
                     srv_uv,
+                    srv_source: (decoder_texture as *const _ as usize, array_slice),
                 })
             }
         }
@@ -1945,6 +2018,13 @@ mod win {
                 };
 
                 // (b) D3D11 side: AcquireSync(0) → plane copy → ReleaseSync(1).
+                // First, re-point the copy-source SRVs at THIS frame's pool
+                // slice: the D3D11VA decoder rotates frames through the hw
+                // texture array, and `frame.data[1]` changes per frame.
+                self.core.ensure_srv_source(
+                    frame_ref.data[0] as *mut c_void,
+                    frame_ref.data[1] as u32,
+                )?;
                 if let (Some(lock_fn), ctx) = (self.lock, self.lock_ctx) {
                     lock_fn(ctx);
                 }
@@ -2713,6 +2793,7 @@ mod win {
         ) -> Result<Option<GlInteropTicket>> {
             unsafe {
                 eprintln!("[opengl] import_frame: enter");
+                let frame_ref = frame.as_ref();
                 self.reclaim();
                 eprintln!("[opengl] import_frame: reclaimed");
 
@@ -2776,6 +2857,12 @@ mod win {
                 let _ = (y_fmt, uv_fmt);
 
                 // (a) D3D11 plane-copy render into the slot's R8/RG8 targets.
+                // Same rotating-slice re-point as the memory-object ring: the
+                // decoder hands each frame on a fresh array slice.
+                self.core.ensure_srv_source(
+                    frame_ref.data[0] as *mut c_void,
+                    frame_ref.data[1] as u32,
+                )?;
                 eprintln!(
                     "[opengl] import_frame: pre-lock lock={:?} ctx={:p}",
                     self.lock, self.lock_ctx
