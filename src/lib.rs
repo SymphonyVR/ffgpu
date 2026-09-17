@@ -5,6 +5,7 @@ pub(crate) mod probe;
 #[cfg(feature = "video")]
 pub(crate) mod software_video;
 pub(crate) mod video;
+pub mod video_caps;
 pub(crate) mod vulkan_device;
 
 pub use context::Context;

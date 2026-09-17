@@ -59,6 +59,36 @@ fn preferred_device_type_for_backend(backend: wgpu::Backend) -> ff::AVHWDeviceTy
     }
 }
 
+/// Read the best video stream's codec id and FF_PROFILE_* id from the
+/// format context, for capability admission BEFORE any decoder is opened.
+/// Returns `(-1, FF_PROFILE_UNKNOWN)` when no video stream exists — which
+/// classifies as `Other`/`Unknown` and denies hardware decode (fail-closed).
+///
+/// # Safety
+/// `format_ctx` must be a live, opened `AVFormatContext`.
+unsafe fn read_video_stream_profile(format_ctx: &mut ffn::format::context::Input) -> (i32, i32) {
+    unsafe {
+        let raw = format_ctx.as_ptr();
+        let stream = {
+            let mut best: *mut ff::AVStream = std::ptr::null_mut();
+            for i in 0..(*raw).nb_streams {
+                let s = *(*raw).streams.add(i as usize);
+                let codec_type = (*(*s).codecpar).codec_type;
+                if codec_type == ff::AVMediaType::AVMEDIA_TYPE_VIDEO {
+                    best = s;
+                    break;
+                }
+            }
+            best
+        };
+        if stream.is_null() {
+            return (-1, crate::video_caps::FF_PROFILE_UNKNOWN);
+        }
+        let params = (*stream).codecpar;
+        ((*params).codec_id as i32, (*params).profile)
+    }
+}
+
 pub struct Statistics {
     pub video_clock: f64,
     pub audio_clock: f64,
@@ -98,6 +128,18 @@ pub struct Video {
     step_needs_copy: u8,
 }
 
+/// Everything `Video::new_with_options` needs beyond the wgpu plumbing to
+/// decide and construct the decode path.
+pub(crate) struct DecoderHandoff {
+    /// Shared FFmpeg Vulkan hardware device context (None = no hwaccel).
+    pub hw_device_ctx: Option<NonNull<ff::AVBufferRef>>,
+    /// Vulkan decode capability matrix gating per-stream admission
+    /// (None = no Vulkan context = deny hardware decode).
+    pub vulkan_decode_caps: Option<crate::video_caps::VulkanVideoDecodeCaps>,
+    /// Software-planes path: never hand the decoder a hardware device.
+    pub force_software: bool,
+}
+
 impl Video {
     pub(crate) fn new<P>(
         instance: wgpu::Instance,
@@ -105,7 +147,7 @@ impl Video {
         device: wgpu::Device,
         queue: wgpu::Queue,
         pipeline_cache: Arc<Mutex<PipelineCache>>,
-        hw_device_ctx: Option<NonNull<ff::AVBufferRef>>,
+        handoff: DecoderHandoff,
         path: &P,
     ) -> Result<(Self, AudioSink)>
     where
@@ -117,8 +159,7 @@ impl Video {
             device,
             queue,
             pipeline_cache,
-            hw_device_ctx,
-            false,
+            handoff,
             path,
         )
     }
@@ -140,8 +181,11 @@ impl Video {
             device,
             queue,
             pipeline_cache,
-            None,
-            true,
+            DecoderHandoff {
+                hw_device_ctx: None,
+                vulkan_decode_caps: None,
+                force_software: true,
+            },
             path,
         )
     }
@@ -152,8 +196,7 @@ impl Video {
         device: wgpu::Device,
         queue: wgpu::Queue,
         pipeline_cache: Arc<Mutex<PipelineCache>>,
-        hw_device_ctx: Option<NonNull<ff::AVBufferRef>>,
-        force_software: bool,
+        handoff: DecoderHandoff,
         path: &P,
     ) -> Result<(Self, AudioSink)>
     where
@@ -168,11 +211,43 @@ impl Video {
         let mut input = Input::open_with_state(path, state.clone())?;
 
         let backend = adapter.get_info().backend;
-        let device_type = if force_software {
+        let DecoderHandoff {
+            hw_device_ctx,
+            vulkan_decode_caps,
+            force_software,
+        } = handoff;
+        let mut device_type = if force_software {
             ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE
         } else {
             preferred_device_type_for_backend(backend)
         };
+        let mut hw_device_ctx = hw_device_ctx;
+
+        // Capability admission (bug-1789674498884): BEFORE handing the
+        // stream to the Vulkan hwaccel, verify the device explicitly
+        // reported support for the stream's decode profile. An admitted-
+        // but-unsupported stream can BLOCK inside avcodec_open2 in the
+        // driver (observed: HEVC 4:4:4 Rext on RTX 2060 driver 596.36
+        // deadlocks the whole process before FFmpeg's own get_format probe
+        // could reject it). Denied (or unclassifiable, or no caps data)
+        // streams decode in software, which is always safe.
+        if device_type == ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN {
+            let (codec_id, profile_id) =
+                unsafe { read_video_stream_profile(&mut input.format_ctx) };
+            let stream = crate::video_caps::classify(codec_id, profile_id);
+            let admitted = vulkan_decode_caps
+                .as_ref()
+                .is_some_and(|caps| crate::video_caps::admit_vulkan_decode(caps, &stream));
+            if !admitted {
+                eprintln!(
+                    "[Video] Vulkan decode denied by capability admission \
+                     (codec_id={codec_id}, profile_id={profile_id}, class={stream:?}); \
+                     using software decode"
+                );
+                device_type = ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
+                hw_device_ctx = None;
+            }
+        }
 
         let video_decoder = video::Decoder::new(&mut input.format_ctx, device_type, hw_device_ctx)?;
         let hw_unsupported = video_decoder.unsupported.clone();

@@ -5,6 +5,7 @@
 //! hardware-accelerated video decoding.
 
 use crate::error::{Error, Result};
+use crate::video_caps::VulkanVideoDecodeCaps;
 
 /// Vulkan Video decode extensions to enable on the VkDevice.
 ///
@@ -291,4 +292,181 @@ pub fn create_vulkan_device_for_video(
         queue,
         video_queue_family_index,
     })
+}
+
+/// One decode profile probe: codec op + std profile idc + 4:2:0 chroma at a
+/// fixed component bit depth.
+#[derive(Clone, Copy)]
+enum ProfileProbe {
+    H264 { std_profile_idc: i32, depth: u8 },
+    H265 { std_profile_idc: i32, depth: u8 },
+}
+
+fn component_bit_depth(depth: u8) -> ash::vk::VideoComponentBitDepthFlagsKHR {
+    match depth {
+        10 => ash::vk::VideoComponentBitDepthFlagsKHR::TYPE_10,
+        12 => ash::vk::VideoComponentBitDepthFlagsKHR::TYPE_12,
+        _ => ash::vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+    }
+}
+
+/// Query one decode profile against the physical device. Supported =
+/// `VK_SUCCESS` (per the VK_KHR_video_queue contract a driver returns an
+/// error code — e.g. `VK_ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR` —
+/// for profiles it cannot decode; `VK_INCOMPLETE` also means "supported
+/// with caveats"). Never blocks on healthy drivers: this is the same
+/// capability query FFmpeg's vulkan hwaccel itself runs during
+/// `avcodec_open2`, moved to BEFORE the hwaccel handoff.
+fn probe_video_profile(
+    fns: &ash::khr::video_queue::InstanceFn,
+    physical_device: ash::vk::PhysicalDevice,
+    probe: ProfileProbe,
+) -> ash::vk::Result {
+    // Per spec, decode-capability queries must chain a
+    // VkVideoDecodeCapabilitiesKHR via pNext.
+    let mut decode_caps = ash::vk::VideoDecodeCapabilitiesKHR::default();
+    let mut vk_caps = ash::vk::VideoCapabilitiesKHR::default().push_next(&mut decode_caps);
+
+    let result = match probe {
+        ProfileProbe::H264 {
+            std_profile_idc,
+            depth,
+        } => {
+            let mut h264_profile = ash::vk::VideoDecodeH264ProfileInfoKHR::default()
+                .std_profile_idc(std_profile_idc as u32);
+            let profile = ash::vk::VideoProfileInfoKHR::default()
+                .video_codec_operation(ash::vk::VideoCodecOperationFlagsKHR::DECODE_H264)
+                .chroma_subsampling(ash::vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+                .luma_bit_depth(component_bit_depth(depth))
+                .chroma_bit_depth(component_bit_depth(depth))
+                .push_next(&mut h264_profile);
+            unsafe {
+                (fns.get_physical_device_video_capabilities_khr)(
+                    physical_device,
+                    &profile,
+                    &mut vk_caps,
+                )
+            }
+        }
+        ProfileProbe::H265 {
+            std_profile_idc,
+            depth,
+        } => {
+            let mut h265_profile = ash::vk::VideoDecodeH265ProfileInfoKHR::default()
+                .std_profile_idc(std_profile_idc as u32);
+            let profile = ash::vk::VideoProfileInfoKHR::default()
+                .video_codec_operation(ash::vk::VideoCodecOperationFlagsKHR::DECODE_H265)
+                .chroma_subsampling(ash::vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+                .luma_bit_depth(component_bit_depth(depth))
+                .chroma_bit_depth(component_bit_depth(depth))
+                .push_next(&mut h265_profile);
+            unsafe {
+                (fns.get_physical_device_video_capabilities_khr)(
+                    physical_device,
+                    &profile,
+                    &mut vk_caps,
+                )
+            }
+        }
+    };
+
+    result
+}
+
+/// `VK_SUCCESS`/`VK_INCOMPLETE` mean the driver reported the profile
+/// (usable, possibly with caveats); every other result — including
+/// `VK_ERROR_VIDEO_PROFILE_*_NOT_SUPPORTED_KHR` — denies.
+fn result_admits(result: ash::vk::Result) -> bool {
+    matches!(
+        result,
+        ash::vk::Result::SUCCESS | ash::vk::Result::INCOMPLETE
+    )
+}
+
+/// Query the device's ACTUAL Vulkan video decode capability matrix
+/// (bug-1789674498884). Called once per ffgpu GPU context; the result gates
+/// per-stream admission BEFORE any hardware decode attempt, so streams the
+/// driver did not explicitly report (e.g. HEVC 4:4:4 Rext on a 420-only
+/// driver) never reach a hwaccel path that may block inside the driver.
+///
+/// v1 queries only the universal 4:2:0 H.264/HEVC profiles; every other
+/// profile denies (see `video_caps` for the policy and its rationale). The
+/// query returns all-false on any error — fail-closed to software.
+pub fn query_decode_caps(
+    instance: &wgpu::Instance,
+    adapter: &wgpu::Adapter,
+) -> VulkanVideoDecodeCaps {
+    let mut caps = VulkanVideoDecodeCaps::default();
+
+    let hal_instance = match unsafe { instance.as_hal::<wgpu::hal::vulkan::Api>() } {
+        Some(h) => h,
+        None => return caps,
+    };
+    let hal_adapter = match unsafe { adapter.as_hal::<wgpu::hal::vulkan::Api>() } {
+        Some(h) => h,
+        None => return caps,
+    };
+    let raw_instance = hal_instance.shared_instance().raw_instance();
+    let physical_device = hal_adapter.raw_physical_device();
+
+    let get_proc_addr = hal_instance
+        .shared_instance()
+        .entry()
+        .static_fn()
+        .get_instance_proc_addr;
+    let fns = ash::khr::video_queue::InstanceFn::load(|name| unsafe {
+        get_proc_addr(raw_instance.handle(), name.as_ptr())
+            .map_or(std::ptr::null(), |f| f as *const std::ffi::c_void)
+    });
+
+    let (r_h264_8, r_h264_10, r_h265_8, r_h265_10) = (
+        probe_video_profile(
+            &fns,
+            physical_device,
+            ProfileProbe::H264 {
+                std_profile_idc: 100, // STD_VIDEO_H264_PROFILE_IDC_HIGH
+                depth: 8,
+            },
+        ),
+        probe_video_profile(
+            &fns,
+            physical_device,
+            ProfileProbe::H264 {
+                std_profile_idc: 110, // STD_VIDEO_H264_PROFILE_IDC_HIGH_10
+                depth: 10,
+            },
+        ),
+        probe_video_profile(
+            &fns,
+            physical_device,
+            ProfileProbe::H265 {
+                std_profile_idc: 1, // STD_VIDEO_H265_PROFILE_IDC_MAIN
+                depth: 8,
+            },
+        ),
+        probe_video_profile(
+            &fns,
+            physical_device,
+            ProfileProbe::H265 {
+                std_profile_idc: 2, // STD_VIDEO_H265_PROFILE_IDC_MAIN_10
+                depth: 10,
+            },
+        ),
+    );
+    // 12-bit HEVC is not queried in v1 (no universal std profile idc): it
+    // stays false and 12-bit HEVC streams admit only when a later revision
+    // extends the query. Fail-closed.
+    caps.h264_420_8 = result_admits(r_h264_8);
+    caps.h264_420_10 = result_admits(r_h264_10);
+    caps.h265_420_8 = result_admits(r_h265_8);
+    caps.h265_420_10 = result_admits(r_h265_10);
+
+    eprintln!(
+        "[VulkanVideo] Decode capability matrix: {caps:?} \
+         (raw results: h264_420_8={r_h264_8:?}, h264_420_10={r_h264_10:?}, \
+         h265_420_8={r_h265_8:?}, h265_420_10={r_h265_10:?}; \
+         all-nonzero = driver reported no matching decode profile — \
+         hardware decode will not be used)"
+    );
+    caps
 }

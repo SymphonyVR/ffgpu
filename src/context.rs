@@ -35,6 +35,11 @@ pub struct Context {
     /// every video opened through this context. This avoids leaking extension
     /// name arrays and re-initializing the Vulkan device for each video.
     vulkan_hw_device_ctx: Option<AvBufferRefPtr>,
+    /// Vulkan video decode capability matrix queried once per context
+    /// (bug-1789674498884): gates per-stream hwaccel admission so streams the
+    /// driver never reported support for (e.g. HEVC 4:4:4 Rext on a
+    /// 420-only driver) never enter a decode path that may block in-driver.
+    vulkan_decode_caps: Option<crate::video_caps::VulkanVideoDecodeCaps>,
 }
 
 impl Context {
@@ -92,7 +97,12 @@ impl Context {
                     &device_extensions,
                 )?
             };
-            Some(AvBufferRefPtr(ctx.as_ptr()))
+            // Capability admission matrix (queried once per context): see
+            // video_caps for the policy. Queried AFTER the hw device context
+            // exists but BEFORE any stream is handed to the hwaccel.
+            let decode_caps = crate::vulkan_device::query_decode_caps(&instance, &adapter);
+            eprintln!("[VulkanVideo] capability matrix queried: {decode_caps:?}");
+            Some((AvBufferRefPtr(ctx.as_ptr()), decode_caps))
         } else {
             None
         };
@@ -103,7 +113,8 @@ impl Context {
             device,
             queue,
             pipeline_cache,
-            vulkan_hw_device_ctx,
+            vulkan_hw_device_ctx: vulkan_hw_device_ctx.map(|(p, _)| p),
+            vulkan_decode_caps: vulkan_hw_device_ctx.map(|(_, c)| c),
         })
     }
 
@@ -117,8 +128,13 @@ impl Context {
             self.device.clone(),
             self.queue.clone(),
             self.pipeline_cache.clone(),
-            self.vulkan_hw_device_ctx
-                .map(|p| NonNull::new(p.0).unwrap()),
+            crate::video::DecoderHandoff {
+                hw_device_ctx: self
+                    .vulkan_hw_device_ctx
+                    .map(|p| NonNull::new(p.0).unwrap()),
+                vulkan_decode_caps: self.vulkan_decode_caps,
+                force_software: false,
+            },
             path,
         )
     }
