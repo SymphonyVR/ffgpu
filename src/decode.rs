@@ -619,6 +619,15 @@ mod avlog {
         }
     }
 
+    /// Stock-FFmpeg level-filter predicate for the router callback
+    /// (`av_log_default_callback` performs the identical check). Custom
+    /// callbacks receive EVERY message; forwarding is correct only for
+    /// levels the global filter would print. Pinned by
+    /// `avlog_level_filter_matches_stock_ffmpeg`.
+    pub(crate) fn should_forward(level: c_int) -> bool {
+        level <= unsafe { ff::av_log_get_level() }
+    }
+
     unsafe extern "C" fn callback(
         avcl: *mut c_void,
         level: c_int,
@@ -633,7 +642,7 @@ mod avlog {
         // each pay the full router cost (format + key build + limiter +
         // log-crate forward) and a multi-minute 100% CPU "hang" replaces a
         // 100 ms open (bug-1789674498884).
-        if level > unsafe { ff::av_log_get_level() } {
+        if !should_forward(level) {
             return;
         }
         let mut buf = [0 as c_char; 1024];
@@ -733,6 +742,27 @@ mod tests {
     use ffmpeg_next::Packet;
     use ffmpeg_next::Rational;
     use std::time::Duration;
+
+    /// bug-1789674498884 root-cause regression pin: the av_log router must
+    /// filter messages exactly like stock `av_log_default_callback`
+    /// (forward iff `level <= av_log_get_level()`). FFmpeg hands custom
+    /// callbacks EVERY message; the mp4 demuxer's per-sample DEBUG/TRACE
+    /// dumps (~100k lines per open on large recordings) must be dropped by
+    /// this predicate, or the open turns into a multi-minute 100% CPU spin.
+    /// At the process default (INFO=32) — nothing in this tree calls
+    /// av_log_set_level — DEBUG(48)/VERBOSE(40)/TRACE(56) drop while
+    /// PANIC(0)/FATAL(8)/ERROR(16)/WARNING(24)/INFO(32) forward.
+    #[test]
+    fn avlog_level_filter_matches_stock_ffmpeg() {
+        assert!(!super::avlog::should_forward(48), "DEBUG must drop");
+        assert!(!super::avlog::should_forward(40), "VERBOSE must drop");
+        assert!(!super::avlog::should_forward(56), "TRACE must drop");
+        assert!(super::avlog::should_forward(32), "INFO must forward");
+        assert!(super::avlog::should_forward(24), "WARNING must forward");
+        assert!(super::avlog::should_forward(16), "ERROR must forward");
+        assert!(super::avlog::should_forward(8), "FATAL must forward");
+        assert!(super::avlog::should_forward(0), "PANIC must forward");
+    }
 
     fn state_with_start_time(start_time: i64) -> DecoderState {
         let state = DecoderState::empty();
