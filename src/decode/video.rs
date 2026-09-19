@@ -620,8 +620,7 @@ impl VideoThread {
                 match message {
                     Message::SkipToTimestamp(ts) => {
                         skip_to_ts = Some(ts);
-                        walk_serial =
-                            Some(self.video_rx.metadata.serial.load(Ordering::Relaxed));
+                        walk_serial = Some(self.video_rx.metadata.serial.load(Ordering::Relaxed));
                         // Hurry-up accurate seek: decode only reference frames
                         // during the keyframe→target walk. B-frames are not
                         // referenced by any other frame, so dropping them keeps
@@ -673,7 +672,9 @@ impl VideoThread {
                 {
                     skip_to_ts = None;
                     walk_serial = None;
-                    self.decoder.decoder.skip_frame(DiscardLevel::Default.into());
+                    self.decoder
+                        .decoder
+                        .skip_frame(DiscardLevel::Default.into());
                     continue;
                 }
 

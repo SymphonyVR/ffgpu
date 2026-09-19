@@ -619,7 +619,23 @@ mod avlog {
         }
     }
 
-    unsafe extern "C" fn callback(avcl: *mut c_void, level: c_int, fmt: *const c_char, vl: ff::va_list) {
+    unsafe extern "C" fn callback(
+        avcl: *mut c_void,
+        level: c_int,
+        fmt: *const c_char,
+        vl: ff::va_list,
+    ) {
+        // FFmpeg hands custom callbacks EVERY message regardless of level —
+        // level filtering is the callback's responsibility
+        // (`av_log_default_callback` performs this exact check). Without it,
+        // the mp4 demuxer's per-sample DEBUG/TRACE dumps on large recordings
+        // (~100k lines per open; "count=%d, duration=%d" stts/ctts runs)
+        // each pay the full router cost (format + key build + limiter +
+        // log-crate forward) and a multi-minute 100% CPU "hang" replaces a
+        // 100 ms open (bug-1789674498884).
+        if level > unsafe { ff::av_log_get_level() } {
+            return;
+        }
         let mut buf = [0 as c_char; 1024];
         let mut print_prefix: c_int = 1;
         // SAFETY: `av_log_format_line` is the documented way to reproduce the
@@ -665,7 +681,11 @@ mod avlog {
             }
             match map.get_mut(&key) {
                 Some(e) if now.duration_since(e.last) >= KEY_IDLE => {
-                    *e = Entry { total: 1, suppressed: 0, last: now };
+                    *e = Entry {
+                        total: 1,
+                        suppressed: 0,
+                        last: now,
+                    };
                     emit = Some((lvl, key.2.clone(), 0));
                 }
                 Some(e) => {
@@ -682,7 +702,14 @@ mod avlog {
                     }
                 }
                 None => {
-                    map.insert(key.clone(), Entry { total: 1, suppressed: 0, last: now });
+                    map.insert(
+                        key.clone(),
+                        Entry {
+                            total: 1,
+                            suppressed: 0,
+                            last: now,
+                        },
+                    );
                     emit = Some((lvl, key.2, 0));
                 }
             }

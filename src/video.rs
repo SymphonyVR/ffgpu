@@ -59,27 +59,49 @@ fn preferred_device_type_for_backend(backend: wgpu::Backend) -> ff::AVHWDeviceTy
     }
 }
 
-/// Read the best video stream's codec id and FF_PROFILE_* id from the
-/// format context, for capability admission BEFORE any decoder is opened.
-/// Returns `(-1, FF_PROFILE_UNKNOWN)` when no video stream exists — which
-/// classifies as `Other`/`Unknown` and denies hardware decode (fail-closed).
+/// Read the video stream's codec id and FF_PROFILE_* id from the format
+/// context, for capability admission BEFORE any decoder is opened.
+/// CRITICAL: this must classify the SAME stream `video::Decoder::new`
+/// will open — `av_find_best_stream` (the `streams().best(Video)`
+/// selector), whose scoring (DEFAULT disposition > codec frames >
+/// bitrate) can differ from first-index order in multi-track files. A
+/// first-index read admitted a track-0 profile while the decoder opened a
+/// track-1 HEVC-REXT stream with the Vulkan device attached (red-team
+/// finding 2026-09-18) — reintroducing the deadlock class. Returns
+/// `(-1, FF_PROFILE_UNKNOWN)` when no video stream exists, which
+/// classifies as `Other`/`Unknown` and routes away (fail-closed).
 ///
 /// # Safety
-/// `format_ctx` must be a live, opened `AVFormatContext`.
+/// `format_ctx` must be a live, opened `AVFormatContext`-backed Input.
 unsafe fn read_video_stream_profile(format_ctx: &mut ffn::format::context::Input) -> (i32, i32) {
     unsafe {
         let raw = format_ctx.as_ptr();
-        let stream = {
-            let mut best: *mut ff::AVStream = std::ptr::null_mut();
+        // Same selector the decoder uses (ffmpeg-next streams().best wraps
+        // av_find_best_stream with decoder probing disabled here).
+        let best = ff::av_find_best_stream(
+            raw as *mut _,
+            ff::AVMediaType::AVMEDIA_TYPE_VIDEO,
+            -1,
+            -1,
+            std::ptr::null_mut(),
+            0,
+        );
+        let stream = if best >= 0 {
+            *(*raw).streams.add(best as usize)
+        } else {
+            // Selector failed (corrupt/odd container): fall back to the
+            // first video-typed stream, mirroring the decoder's own
+            // tolerance; none at all -> deny.
+            let mut found: *mut ff::AVStream = std::ptr::null_mut();
             for i in 0..(*raw).nb_streams {
                 let s = *(*raw).streams.add(i as usize);
                 let codec_type = (*(*s).codecpar).codec_type;
                 if codec_type == ff::AVMediaType::AVMEDIA_TYPE_VIDEO {
-                    best = s;
+                    found = s;
                     break;
                 }
             }
-            best
+            found
         };
         if stream.is_null() {
             return (-1, crate::video_caps::FF_PROFILE_UNKNOWN);
@@ -225,32 +247,62 @@ impl Video {
 
         // Capability admission (bug-1789674498884): BEFORE handing the
         // stream to the Vulkan hwaccel, verify the device explicitly
-        // reported support for the stream's decode profile. An admitted-
-        // but-unsupported stream can BLOCK inside avcodec_open2 in the
-        // driver (observed: HEVC 4:4:4 Rext on RTX 2060 driver 596.36
-        // deadlocks the whole process before FFmpeg's own get_format probe
-        // could reject it). Denied (or unclassifiable, or no caps data)
-        // streams decode in software, which is always safe.
+        // reported the stream's decode profile. An admitted-but-unreported
+        // stream can BLOCK inside avcodec_open2 in the driver (observed:
+        // HEVC 4:4:4 Rext on RTX 2060 driver 596.36 deadlocks the process
+        // before FFmpeg's own get_format probe could reject it). Routing
+        // (user ruling 2026-09-17): admitted -> Vulkan; unreported on
+        // Windows -> D3D11VA (its own probe ladder handles the rest — the
+        // pre-fix logs prove D3D11VA/NVDEC decoded these exact streams);
+        // elsewhere -> software. A Vulkan denial never conflates "Vulkan
+        // cannot decode this" with "no hardware decoder can".
+        let mut routed_away = false;
         if device_type == ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN {
             let (codec_id, profile_id) =
                 unsafe { read_video_stream_profile(&mut input.format_ctx) };
             let stream = crate::video_caps::classify(codec_id, profile_id);
-            let admitted = vulkan_decode_caps
-                .as_ref()
-                .is_some_and(|caps| crate::video_caps::admit_vulkan_decode(caps, &stream));
-            if !admitted {
-                eprintln!(
-                    "[Video] Vulkan decode denied by capability admission \
-                     (codec_id={codec_id}, profile_id={profile_id}, class={stream:?}); \
-                     using software decode"
-                );
-                device_type = ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
-                hw_device_ctx = None;
+            let route = crate::video_caps::route_stream(
+                vulkan_decode_caps.as_ref(),
+                &stream,
+                cfg!(target_os = "windows"),
+            );
+            match route {
+                crate::video_caps::DecodeRoute::Vulkan => {}
+                crate::video_caps::DecodeRoute::D3d11va => {
+                    eprintln!(
+                        "[Video] Vulkan decode denied by capability admission \
+                         (codec_id={codec_id}, profile_id={profile_id}, class={stream:?}); \
+                         routing to D3D11VA"
+                    );
+                    device_type = ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA;
+                    hw_device_ctx = None;
+                    routed_away = true;
+                }
+                crate::video_caps::DecodeRoute::Software => {
+                    eprintln!(
+                        "[Video] Vulkan decode denied by capability admission \
+                         (codec_id={codec_id}, profile_id={profile_id}, class={stream:?}); \
+                         using software decode"
+                    );
+                    device_type = ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
+                    hw_device_ctx = None;
+                    routed_away = true;
+                }
             }
         }
 
         let video_decoder = video::Decoder::new(&mut input.format_ctx, device_type, hw_device_ctx)?;
         let hw_unsupported = video_decoder.unsupported.clone();
+        if routed_away {
+            // Admission routed the stream away from Vulkan BEFORE any
+            // hwaccel attempt; is_software_fallback()/hwaccel telemetry
+            // must not claim a Vulkan handoff that never happened. For the
+            // D3D11VA route the flag stays false — that path owns its own
+            // probe ladder and may genuinely hardware-decode.
+            if device_type == ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE {
+                hw_unsupported.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         let audio_decoder = audio::Decoder::new(&mut input)?;
         let has_audio = audio_decoder.is_some();
         let frame_decoder = frames::FrameDecoder::new(

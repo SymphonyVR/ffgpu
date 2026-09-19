@@ -322,9 +322,22 @@ fn probe_video_profile(
     physical_device: ash::vk::PhysicalDevice,
     probe: ProfileProbe,
 ) -> ash::vk::Result {
-    // Per spec, decode-capability queries must chain a
-    // VkVideoDecodeCapabilitiesKHR via pNext.
-    let mut decode_caps = ash::vk::VideoDecodeCapabilitiesKHR::default();
+    // Per spec (VUID-07183/07184/07185): decode-capability queries must
+    // chain VkVideoDecodeCapabilitiesKHR AND the codec-specific
+    // VkVideoDecode{H264,H265}CapabilitiesKHR via pNext. FFmpeg's
+    // vulkan_decode.c chains the same structs; omitting them is formally
+    // invalid and a conforming driver may return spurious errors.
+    // Chain constructed at function scope so every link outlives the vk
+    // call (the profile-side structs below also borrow within this scope).
+    let mut h264_caps = ash::vk::VideoDecodeH264CapabilitiesKHR::default();
+    let mut h265_caps = ash::vk::VideoDecodeH265CapabilitiesKHR::default();
+    let mut decode_caps = ash::vk::VideoDecodeCapabilitiesKHR {
+        p_next: match probe {
+            ProfileProbe::H264 { .. } => &mut h264_caps as *mut _ as *mut std::ffi::c_void,
+            ProfileProbe::H265 { .. } => &mut h265_caps as *mut _ as *mut std::ffi::c_void,
+        },
+        ..Default::default()
+    };
     let mut vk_caps = ash::vk::VideoCapabilitiesKHR::default().push_next(&mut decode_caps);
 
     let result = match probe {
@@ -453,9 +466,10 @@ pub fn query_decode_caps(
             },
         ),
     );
-    // 12-bit HEVC is not queried in v1 (no universal std profile idc): it
-    // stays false and 12-bit HEVC streams admit only when a later revision
-    // extends the query. Fail-closed.
+    // 12-bit HEVC has no separate FFmpeg profile id (REXT covers it with
+    // indeterminate chroma) and is not queried in v1: it stays unreported
+    // and HEVC REXT streams route away. Fail-closed.
+
     caps.h264_420_8 = result_admits(r_h264_8);
     caps.h264_420_10 = result_admits(r_h264_10);
     caps.h265_420_8 = result_admits(r_h265_8);
