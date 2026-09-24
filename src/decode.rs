@@ -628,11 +628,18 @@ mod avlog {
         level <= unsafe { ff::av_log_get_level() }
     }
 
+    // Linux bindgen exposes the decayed C va_list parameter as a pointer;
+    // the Windows bindings use their platform-specific va_list alias.
+    #[cfg(target_os = "linux")]
+    type CallbackVaList = *mut ff::__va_list_tag;
+    #[cfg(not(target_os = "linux"))]
+    type CallbackVaList = ff::va_list;
+
     unsafe extern "C" fn callback(
         avcl: *mut c_void,
         level: c_int,
         fmt: *const c_char,
-        vl: ff::va_list,
+        vl: CallbackVaList,
     ) {
         // FFmpeg hands custom callbacks EVERY message regardless of level —
         // level filtering is the callback's responsibility

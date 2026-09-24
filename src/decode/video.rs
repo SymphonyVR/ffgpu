@@ -264,8 +264,10 @@ impl Decoder {
         unsafe { (*decoder_ctx.as_mut_ptr()).extra_hw_frames = 8 };
         decoder_ctx.set_parameters(video_stream.parameters())?;
 
+        let mut device_type = device_type;
         let mut is_hwaccel = device_type != ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
         let mut hw_pixel_format = ff::AVPixelFormat::AV_PIX_FMT_NONE;
+        let mut vaapi_fallback = false;
 
         if is_hwaccel {
             for i in 0..16 {
@@ -291,6 +293,31 @@ impl Decoder {
                 );
                 log::warn!("using software decode");
                 is_hwaccel = false;
+            }
+        }
+
+        // A GL adapter can exist without a VA-API render device (for example,
+        // Mesa llvmpipe). Probe before choosing decoder threading/get_format so
+        // an unavailable device uses the normal software decoder from the start.
+        // A successfully created ref belongs to decoder_ctx and is freed with it.
+        if is_hwaccel
+            && device_type == ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI
+            && hw_device_ctx.is_none()
+        {
+            let mut hwctx = null_mut();
+            let ret = unsafe {
+                ff::av_hwdevice_ctx_create(&mut hwctx, device_type, null(), null_mut(), 0)
+            };
+            if ret < 0 || hwctx.is_null() {
+                if !hwctx.is_null() {
+                    unsafe { ff::av_buffer_unref(&mut hwctx) };
+                }
+                log::warn!("VA-API device unavailable ({ret}); using software decode");
+                is_hwaccel = false;
+                device_type = ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
+                vaapi_fallback = true;
+            } else {
+                unsafe { (*decoder_ctx.as_mut_ptr()).hw_device_ctx = hwctx };
             }
         }
 
@@ -324,6 +351,9 @@ impl Decoder {
         }
 
         let unsupported = Arc::new(AtomicBool::new(false));
+        if vaapi_fallback {
+            unsupported.store(true, Ordering::Relaxed);
+        }
         let decoder_data = if is_hwaccel {
             let mut decoder_data = Box::pin(DecoderData {
                 hw_pixel_format,
@@ -350,7 +380,7 @@ impl Decoder {
             unsafe {
                 if let Some(ctx) = hw_device_ctx {
                     (*decoder_ctx.as_mut_ptr()).hw_device_ctx = ff::av_buffer_ref(ctx.as_ptr());
-                } else {
+                } else if (*decoder_ctx.as_mut_ptr()).hw_device_ctx.is_null() {
                     let mut hwctx = null_mut();
                     if device_type == ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA {
                         let mut opts: *mut ff::AVDictionary = null_mut();

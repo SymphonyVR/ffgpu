@@ -1,3 +1,8 @@
+// This legacy VA-API Vulkan adapter has no selection or construction site, and
+// its intended `decode::hw` trait module no longer exists. Keep the incomplete
+// work-in-progress implementation excluded until it has a complete adapter.
+#![cfg(any())]
+
 use super::FrameAdapter;
 use super::GlInteropTicket;
 use crate::{

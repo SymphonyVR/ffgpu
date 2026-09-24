@@ -37,8 +37,11 @@ use crate::{
     error::{Error, Result},
 };
 use ffmpeg_next::sys as ff;
+#[cfg(target_os = "windows")]
 use std::ffi::c_void;
-use std::{ptr::NonNull, sync::OnceLock};
+use std::ptr::NonNull;
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
 
 // `gl` 0.14 only generates core GL entry points, not the EXT_memory_object /
 // EXT_external_objects extensions we need. We declare the extension function
@@ -47,21 +50,30 @@ use std::{ptr::NonNull, sync::OnceLock};
 // extensions.
 
 // --- glext.h constant values (authoritative, from Khronos registry) ---
+#[cfg(target_os = "windows")]
 const GL_R8: gl::types::GLenum = 0x8229;
+#[cfg(target_os = "windows")]
 const GL_RG8: gl::types::GLenum = 0x822B;
+#[cfg(target_os = "windows")]
 const GL_R16: gl::types::GLenum = 0x822A;
+#[cfg(target_os = "windows")]
 const GL_RG16: gl::types::GLenum = 0x822C;
 const GL_TEXTURE_2D: gl::types::GLenum = 0x0DE1;
 const GL_NEAREST: gl::types::GLenum = 0x2600;
+#[cfg(target_os = "windows")]
 const GL_TRUE: gl::types::GLboolean = 1;
 // GL_EXT_memory_object_win32 handle types
+#[cfg(target_os = "windows")]
 const GL_HANDLE_TYPE_D3D11_IMAGE_EXT: gl::types::GLenum = 0x958B;
 #[allow(dead_code)] // sibling handle type kept for the opaque-win32 import variant
 const GL_HANDLE_TYPE_OPAQUE_WIN32_EXT: gl::types::GLenum = 0x9587;
 // GL_EXT_memory_object pname values
+#[cfg(target_os = "windows")]
 const GL_DEDICATED_MEMORY_OBJECT_EXT: gl::types::GLenum = 0x9581;
 // GL_EXT_external_objects_win32
+#[cfg(target_os = "windows")]
 const GL_DEVICE_LUID_EXT: gl::types::GLenum = 0x9599;
+#[cfg(target_os = "windows")]
 const GL_DEVICE_NODE_MASK_EXT: gl::types::GLenum = 0x959A;
 
 #[cfg(target_os = "windows")]
@@ -265,6 +277,7 @@ pub enum OpenGlInteropPath {
     DirectPlaneImport,
     /// Windows: D3D11VA → D3D11 plane-copy shader → GL external memory import.
     /// One GPU copy, no CPU readback.
+    #[cfg(target_os = "windows")]
     GpuPlaneCopyThenImport,
     /// Windows experimental: import the D3D11VA decoder surface directly via
     /// `GL_EXT_memory_object_win32` with no plane copy. Capability-gated.
@@ -522,16 +535,16 @@ mod linux {
     const EGL_DMA_BUF_PLANE0_FD_EXT: gl::types::GLenum = 0x3272;
     const EGL_DMA_BUF_PLANE0_OFFSET_EXT: gl::types::GLenum = 0x3273;
     const EGL_DMA_BUF_PLANE0_PITCH_EXT: gl::types::GLenum = 0x3274;
-    const EGL_DMA_BUF_PLANE1_FD_EXT: gl::types::GLenum = EGL_DMA_BUF_PLANE0_FD_EXT + 3;
-    const EGL_DMA_BUF_PLANE1_OFFSET_EXT: gl::types::GLenum = EGL_DMA_BUF_PLANE0_OFFSET_EXT + 3;
-    const EGL_DMA_BUF_PLANE1_PITCH_EXT: gl::types::GLenum = EGL_DMA_BUF_PLANE0_PITCH_EXT + 3;
     const EGL_WIDTH: gl::types::GLenum = 0x3057;
     const EGL_HEIGHT: gl::types::GLenum = 0x3056;
     const EGL_NONE: gl::types::GLenum = 0x3038;
 
-    // Raw libEGL functions (always present when wgpu uses the GL/EGL backend).
-    extern "C" {
+    // Link the runtime soname: Linux GL installations need libEGL.so.1, but
+    // need not ship the development-only libEGL.so symlink.
+    #[link(name = "libEGL.so.1", kind = "dylib", modifiers = "+verbatim")]
+    unsafe extern "C" {
         fn eglGetCurrentDisplay() -> *mut c_void;
+        fn eglGetProcAddress(name: *const std::os::raw::c_char) -> *mut c_void;
         fn eglCreateImage(
             display: *mut c_void,
             ctx: *mut c_void,
@@ -546,28 +559,21 @@ mod linux {
 
     unsafe fn load_egl_image_target() -> Option<PfnEGLImageTargetTexture2DOES> {
         // EGL and GL share the same proc-address space on EGL platforms.
-        let name = std::ffi::CStr::from_bytes_with_nul(b"glEGLImageTargetTexture2DOES\0").ok()?;
-        let ptr = egl_get_proc_address(name.as_ptr());
+        let ptr = egl_get_proc_address(c"glEGLImageTargetTexture2DOES".as_ptr());
         if ptr.is_null() {
             None
         } else {
-            Some(std::mem::transmute(ptr))
+            Some(std::mem::transmute::<
+                *mut c_void,
+                PfnEGLImageTargetTexture2DOES,
+            >(ptr))
         }
     }
 
     unsafe fn egl_get_proc_address(name: *const std::os::raw::c_char) -> *mut c_void {
-        // Pulled from libEGL via the standard `eglGetProcAddress` symbol.
-        unsafe extern "C" fn eglGetProcAddress(_name: *const std::os::raw::c_char) -> *mut c_void {
-            // Resolved below through the real libEGL symbol.
-            resolve_egl_proc_address(_name)
-        }
-        let _ = eglGetProcAddress;
-        resolve_egl_proc_address(name)
-    }
-
-    // `resolve_egl_proc_address` is provided by linking libEGL; declare it.
-    extern "C" {
-        fn resolve_egl_proc_address(name: *const std::os::raw::c_char) -> *mut c_void;
+        // SAFETY: `name` comes from `CStr::from_bytes_with_nul`, and the linked
+        // libEGL resolver accepts that ABI contract.
+        unsafe { eglGetProcAddress(name) }
     }
 
     /// EGL interop handles for a single imported plane.
@@ -582,8 +588,11 @@ mod linux {
                 if self.gl_tex != 0 {
                     gl::DeleteTextures(1, &self.gl_tex);
                 }
+                // SAFETY: libEGL permits querying the current display without arguments.
                 let display = eglGetCurrentDisplay();
                 if !self.image.is_null() && !display.is_null() {
+                    // SAFETY: `self.image` was created by `eglCreateImage` for
+                    // this current display and is destroyed exactly once in Drop.
                     eglDestroyImage(display, self.image);
                 }
             }
@@ -622,7 +631,11 @@ mod linux {
                 0,
             ];
 
+            // SAFETY: this import runs with a current EGL display; libEGL
+            // accepts that current-display handle for image creation.
             let display = eglGetCurrentDisplay();
+            // SAFETY: `attrs` is NUL-terminated and libEGL consumes the valid
+            // duplicated DRM-PRIME file descriptor before returning.
             let image = eglCreateImage(
                 display,
                 std::ptr::null_mut(),
@@ -681,6 +694,7 @@ mod linux {
                     return Err(Error::TextureShare);
                 }
 
+                // SAFETY: libEGL permits querying the current display without arguments.
                 let display = eglGetCurrentDisplay();
 
                 let r8 = &drm_desc.layers[0].planes[0];
@@ -1323,7 +1337,10 @@ mod win {
         d3d11_device: &D3D11::ID3D11Device,
         decoder_texture: &D3D11::ID3D11Texture2D,
         array_slice: u32,
-    ) -> Result<(D3D11::ID3D11ShaderResourceView, D3D11::ID3D11ShaderResourceView)> {
+    ) -> Result<(
+        D3D11::ID3D11ShaderResourceView,
+        D3D11::ID3D11ShaderResourceView,
+    )> {
         unsafe {
             let mut tex_desc = D3D11::D3D11_TEXTURE2D_DESC::default();
             decoder_texture.GetDesc(&mut tex_desc);
@@ -1378,11 +1395,7 @@ mod win {
             };
             let mut srv_uv = None;
             d3d11_device
-                .CreateShaderResourceView(
-                    decoder_texture,
-                    Some(&srv_desc_uv),
-                    Some(&mut srv_uv),
-                )
+                .CreateShaderResourceView(decoder_texture, Some(&srv_desc_uv), Some(&mut srv_uv))
                 .map_err(|e| {
                     eprintln!("[opengl] CreateShaderResourceView(UV) FAILED: {:?}", e);
                     Error::TextureShare
@@ -1449,7 +1462,8 @@ mod win {
                     );
                     return Err(Error::TextureShare);
                 }
-                let (srv_y, srv_uv) = create_plane_srvs(d3d11_device, decoder_texture, array_slice)?;
+                let (srv_y, srv_uv) =
+                    create_plane_srvs(d3d11_device, decoder_texture, array_slice)?;
                 eprintln!(
                     "[opengl] Y/UV SRVs created OK (array_slice={})",
                     array_slice
