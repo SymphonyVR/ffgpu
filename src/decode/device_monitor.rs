@@ -94,17 +94,41 @@ mod linux_impl {
     use super::mark_audio_device_changed;
     use libpulse_binding::{
         context::{
-            Context, FlagSet,
+            Context, FlagSet, State,
             subscribe::{Facility, InterestMaskSet, Operation},
         },
-        mainloop::standard::Mainloop,
+        mainloop::standard::{IterateResult, Mainloop},
     };
 
     pub fn register_audio_listener() {
-        let mut mainloop = Mainloop::new().expect("PulseAudio mainloop");
-        let mut ctx = Context::new(&mainloop, "ffgpu-audio-monitor").expect("PulseAudio context");
-        ctx.connect(None, FlagSet::NOFLAGS, None)
-            .expect("PulseAudio connect");
+        let Some(mut mainloop) = Mainloop::new() else {
+            log::debug!("[AudioMonitor] Linux: could not create PulseAudio mainloop");
+            return;
+        };
+        let Some(mut ctx) = Context::new(&mainloop, "ffgpu-audio-monitor") else {
+            log::debug!("[AudioMonitor] Linux: could not create PulseAudio context");
+            return;
+        };
+        if let Err(err) = ctx.connect(None, FlagSet::NOFLAGS, None) {
+            log::debug!("[AudioMonitor] Linux: PulseAudio connect failed: {err}");
+            return;
+        }
+
+        // connect is asynchronous: subscribing before Ready can produce a null
+        // PulseAudio operation (which libpulse-binding treats as a panic).
+        loop {
+            match ctx.get_state() {
+                State::Ready => break,
+                State::Failed | State::Terminated => return,
+                _ => {}
+            }
+            // Wait for a state-change event rather than spinning while the
+            // server connection is pending.
+            match mainloop.iterate(true) {
+                IterateResult::Success(_) => {}
+                IterateResult::Err(_) | IterateResult::Quit(_) => return,
+            }
+        }
 
         ctx.set_subscribe_callback(Some(Box::new(|facility, op, _idx| {
             let relevant_facility =
@@ -119,7 +143,9 @@ mod linux_impl {
         ctx.subscribe(InterestMaskSet::SINK | InterestMaskSet::SERVER, |_| {});
 
         // Blocks until PulseAudio shuts down.
-        mainloop.run().expect("PulseAudio mainloop run");
+        if let Err(err) = mainloop.run() {
+            log::debug!("[AudioMonitor] Linux: PulseAudio mainloop stopped: {err:?}");
+        }
     }
 }
 
