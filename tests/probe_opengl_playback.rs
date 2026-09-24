@@ -268,16 +268,17 @@ fn probe_gl_playback_pixels_live() {
         }
         std::thread::sleep(wait.min(Duration::from_millis(33)));
     }
-    let frozen_windows = sample_log
-        .windows(2)
-        .filter(|w| w[1].2 < 0.1)
-        .count();
+    let frozen_windows = sample_log.windows(2).filter(|w| w[1].2 < 0.1).count();
     eprintln!(
         "[probe] {} samples, {} frozen-adjacent pairs",
         sample_log.len(),
         frozen_windows
     );
-    eprintln!("[probe] decoded {} frames in {:?}", decoded, start.elapsed());
+    eprintln!(
+        "[probe] decoded {} frames in {:?}",
+        decoded,
+        start.elapsed()
+    );
     assert!(decoded >= 1, "no frames decoded on GL path");
 
     let (mean, sd) = read_texture_mean(&device, &queue, video.texture(), width, height);

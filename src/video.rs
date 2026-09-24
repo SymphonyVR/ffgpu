@@ -54,7 +54,13 @@ fn preferred_device_type_for_backend(_backend: wgpu::Backend) -> ff::AVHWDeviceT
 #[cfg(target_os = "linux")]
 fn preferred_device_type_for_backend(backend: wgpu::Backend) -> ff::AVHWDeviceType {
     match backend {
-        wgpu::Backend::Vulkan => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+        wgpu::Backend::Vulkan => {
+            if crate::cuda_interop::is_cuda_available() {
+                ff::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA
+            } else {
+                ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN
+            }
+        }
         _ => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
     }
 }
@@ -279,14 +285,37 @@ impl Video {
                     routed_away = true;
                 }
                 crate::video_caps::DecodeRoute::Software => {
-                    eprintln!(
-                        "[Video] Vulkan decode denied by capability admission \
-                         (codec_id={codec_id}, profile_id={profile_id}, class={stream:?}); \
-                         using software decode"
-                    );
-                    device_type = ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
-                    hw_device_ctx = None;
-                    routed_away = true;
+                    #[cfg(target_os = "linux")]
+                    if crate::cuda_interop::is_cuda_available() {
+                        eprintln!(
+                            "[Video] Vulkan decode denied by capability admission \
+                             (codec_id={codec_id}, profile_id={profile_id}, class={stream:?}); \
+                             routing to CUDA NVDEC zero-copy"
+                        );
+                        device_type = ff::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA;
+                        hw_device_ctx = None;
+                        routed_away = true;
+                    } else {
+                        eprintln!(
+                            "[Video] Vulkan decode denied by capability admission \
+                             (codec_id={codec_id}, profile_id={profile_id}, class={stream:?}); \
+                             using software decode"
+                        );
+                        device_type = ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
+                        hw_device_ctx = None;
+                        routed_away = true;
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        eprintln!(
+                            "[Video] Vulkan decode denied by capability admission \
+                             (codec_id={codec_id}, profile_id={profile_id}, class={stream:?}); \
+                             using software decode"
+                        );
+                        device_type = ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
+                        hw_device_ctx = None;
+                        routed_away = true;
+                    }
                 }
             }
         }

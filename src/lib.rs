@@ -6,6 +6,7 @@ pub(crate) mod probe;
 pub(crate) mod software_video;
 pub(crate) mod video;
 pub mod video_caps;
+pub mod cuda_interop;
 pub(crate) mod vulkan_device;
 
 pub use context::Context;

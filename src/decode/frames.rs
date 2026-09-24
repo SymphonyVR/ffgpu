@@ -4,6 +4,8 @@ mod software;
 mod d3d11va;
 #[cfg(target_os = "linux")]
 mod vaapi;
+#[cfg(target_os = "linux")]
+mod cuda;
 #[cfg(target_os = "macos")]
 mod video_toolbox;
 
@@ -252,6 +254,10 @@ impl FrameDecoder {
                     }
                     (_, ff::AVPixelFormat::AV_PIX_FMT_VULKAN) => {
                         Box::new(vulkan_video::VulkanVideoFrameAdapter::new(decoder)?) as _
+                    }
+                    #[cfg(target_os = "linux")]
+                    (_, ff::AVPixelFormat::AV_PIX_FMT_CUDA) => {
+                        Box::new(cuda::CudaZeroCopyFrameAdapter::new(decoder)?) as _
                     }
                     (_, format) if software::SoftwareFrameAdapter::supports_format(format) => {
                         log::warn!("using CPU frame copies");
