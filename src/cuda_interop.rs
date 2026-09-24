@@ -183,6 +183,24 @@ fn load_sym<T>(handle: *mut c_void, name: &str) -> Option<T> {
     }
 }
 
+#[cfg(target_os = "windows")]
+unsafe extern "system" {
+    fn LoadLibraryA(lpLibFileName: *const u8) -> *mut c_void;
+    fn GetProcAddress(hModule: *mut c_void, lpProcName: *const u8) -> *mut c_void;
+}
+
+#[cfg(target_os = "windows")]
+fn load_sym<T>(handle: *mut c_void, name: &str) -> Option<T> {
+    let c_str = std::ffi::CString::new(name).ok()?;
+    let sym = unsafe { GetProcAddress(handle, c_str.as_ptr() as *const u8) };
+    if sym.is_null() {
+        log::warn!("[CUDA] Missing symbol: {}", name);
+        None
+    } else {
+        Some(unsafe { std::mem::transmute_copy(&sym) })
+    }
+}
+
 pub fn get_cuda_driver() -> Option<&'static CudaDriver> {
     CUDA_DRIVER.get_or_init(|| {
         #[cfg(target_os = "linux")]
@@ -269,7 +287,89 @@ pub fn get_cuda_driver() -> Option<&'static CudaDriver> {
             Some(driver)
         }
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "windows")]
+        unsafe {
+            let candidate_paths = [
+                b"nvcuda.dll\0".as_ptr(),
+                b"C:\\Windows\\System32\\nvcuda.dll\0".as_ptr(),
+            ];
+
+            let mut handle: *mut c_void = std::ptr::null_mut();
+            for path in &candidate_paths {
+                handle = LoadLibraryA(*path);
+                if !handle.is_null() {
+                    log::info!("[CUDA] Loaded CUDA driver from nvcuda.dll");
+                    break;
+                }
+            }
+
+            if handle.is_null() {
+                log::debug!("[CUDA] nvcuda.dll not found on this system");
+                return None;
+            }
+
+            let driver = CudaDriver {
+                cu_init: load_sym(handle, "cuInit")?,
+                cu_driver_get_version: load_sym(handle, "cuDriverGetVersion")?,
+                cu_device_get: load_sym(handle, "cuDeviceGet")?,
+                cu_device_primary_ctx_retain: load_sym(handle, "cuDevicePrimaryCtxRetain")?,
+                cu_ctx_set_current: load_sym(handle, "cuCtxSetCurrent")?,
+                cu_stream_create: load_sym(handle, "cuStreamCreate")?,
+                cu_stream_destroy: load_sym(handle, "cuStreamDestroy")?,
+                cu_stream_synchronize: load_sym(handle, "cuStreamSynchronize")?,
+                cu_import_external_memory: load_sym(handle, "cuImportExternalMemory")?,
+                cu_destroy_external_memory: load_sym(handle, "cuDestroyExternalMemory")?,
+                cu_external_memory_get_mapped_mipmapped_array: load_sym(
+                    handle,
+                    "cuExternalMemoryGetMappedMipmappedArray",
+                )?,
+                cu_mipmapped_array_get_level: load_sym(handle, "cuMipmappedArrayGetLevel")?,
+                cu_mipmapped_array_destroy: load_sym(handle, "cuMipmappedArrayDestroy")?,
+                cu_memcpy_2d_async: load_sym(handle, "cuMemcpy2DAsync_v2")
+                    .or_else(|| load_sym(handle, "cuMemcpy2DAsync"))?,
+                cu_mem_alloc_host: load_sym(handle, "cuMemAllocHost_v2")
+                    .or_else(|| load_sym(handle, "cuMemAllocHost"))?,
+                cu_mem_free_host: load_sym(handle, "cuMemFreeHost")?,
+                primary_ctx: std::ptr::null_mut(),
+            };
+
+            let res = (driver.cu_init)(0);
+            if res != CUDA_SUCCESS {
+                log::warn!("[CUDA] cuInit(0) failed with code: {:?}", res);
+                return None;
+            }
+
+            let mut version = 0i32;
+            let _ = (driver.cu_driver_get_version)(&mut version);
+            eprintln!("[CUDA] Initialized Windows CUDA driver version: {}", version);
+
+            let mut dev: CUdevice = 0;
+            let res = (driver.cu_device_get)(&mut dev, 0);
+            if res != CUDA_SUCCESS {
+                eprintln!("[CUDA] cuDeviceGet(0) failed: {:?}", res);
+                return None;
+            }
+
+            let mut primary_ctx: CUcontext = std::ptr::null_mut();
+            let res = (driver.cu_device_primary_ctx_retain)(&mut primary_ctx, dev);
+            if res != CUDA_SUCCESS || primary_ctx.is_null() {
+                eprintln!("[CUDA] cuDevicePrimaryCtxRetain failed: {:?}", res);
+                return None;
+            }
+
+            let res = (driver.cu_ctx_set_current)(primary_ctx);
+            if res != CUDA_SUCCESS {
+                eprintln!("[CUDA] cuCtxSetCurrent failed: {:?}", res);
+                return None;
+            }
+
+            let mut driver = driver;
+            driver.primary_ctx = primary_ctx;
+
+            Some(driver)
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
             None
         }
