@@ -209,14 +209,7 @@ impl AudioThread {
             let stream = self.state.audio_stream.load().clone();
 
             let format = ffn::format::Sample::F32(ffn::format::sample::Type::Packed);
-            let channel_layout = ffn::ChannelLayout(ff::AVChannelLayout {
-                order: ff::AVChannelOrder::AV_CHANNEL_ORDER_NATIVE,
-                nb_channels: parameters.channels as _,
-                u: ff::AVChannelLayout__bindgen_ty_1 {
-                    mask: (1 << parameters.channels) - 1,
-                },
-                opaque: std::ptr::null_mut(),
-            });
+            let channel_layout = ffn::ChannelLayout::default(parameters.channels as _);
 
             let resampler = ffn::software::resampler(
                 (
@@ -356,9 +349,7 @@ impl AudioThread {
                         let resampled_pts =
                             resampled_pts / self.decoder.metadata.sample_rate as i64;
 
-                        if audio_frame.channel_layout().0.order
-                            == ff::AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC
-                        {
+                        if audio_frame.channel_layout().is_empty() {
                             let channels = audio_frame.channels();
                             audio_frame
                                 .set_channel_layout(ffn::ChannelLayout::default(channels as _));
