@@ -845,11 +845,33 @@ impl Video {
 
     #[inline]
     pub fn decoder_name(&self) -> &'static str {
-        self.frame_decoder
-            .adapter
-            .as_ref()
-            .map(|adapter| adapter.name())
-            .unwrap_or("Unknown")
+        if let Some(adapter) = self.frame_decoder.adapter.as_ref() {
+            adapter.name()
+        } else if self.is_software_fallback() {
+            "ffgpu (software)"
+        } else {
+            unsafe {
+                let codec_ctx = self.video_decoder.as_ptr();
+                if !(*codec_ctx).hw_device_ctx.is_null() {
+                    let hw_device_ctx =
+                        (*(*codec_ctx).hw_device_ctx).data as *mut ff::AVHWDeviceContext;
+                    if !hw_device_ctx.is_null() {
+                        match (*hw_device_ctx).type_ {
+                            ff::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA => "CUDA (NVDEC)",
+                            ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN => "Vulkan Video",
+                            ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA => "D3D11VA",
+                            ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI => "VA-API",
+                            ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX => "VideoToolbox",
+                            _ => "ffgpu (hardware)",
+                        }
+                    } else {
+                        "ffgpu (hardware)"
+                    }
+                } else {
+                    "ffgpu (software)"
+                }
+            }
+        }
     }
 
     /// Codec short name (e.g. "h264", "hevc", "vp9", "av1") read from the

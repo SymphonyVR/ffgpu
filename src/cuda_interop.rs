@@ -379,3 +379,19 @@ pub fn get_cuda_driver() -> Option<&'static CudaDriver> {
 pub fn is_cuda_available() -> bool {
     get_cuda_driver().is_some()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cuda_driver_loading() {
+        let available = is_cuda_available();
+        eprintln!("[TEST] is_cuda_available: {}", available);
+        if let Some(driver) = get_cuda_driver() {
+            eprintln!("[TEST] CUDA driver loaded successfully, primary_ctx={:?}", driver.primary_ctx);
+        } else {
+            eprintln!("[TEST] CUDA driver failed to load");
+        }
+    }
+}

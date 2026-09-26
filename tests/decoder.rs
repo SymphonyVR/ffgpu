@@ -160,3 +160,105 @@ fn av1_test_webm_codec_id() {
         codec_id
     );
 }
+
+
+#[test]
+fn test_cuda_decode_tiny_mp4() {
+    ffmpeg_next::init().unwrap();
+    use ffmpeg_next::sys as ff;
+
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("tests/data/tiny.mp4");
+    if !path.exists() {
+        eprintln!("[probe] tests/data/tiny.mp4 missing");
+        return;
+    }
+
+    let mut input = ffmpeg_next::format::input(&path).unwrap();
+    let (stream_index, codec_params) = {
+        let stream = input.streams().best(ffmpeg_next::media::Type::Video).unwrap();
+        (stream.index(), stream.parameters())
+    };
+    let codec_id = codec_params.id();
+    let decoder = ffmpeg_next::decoder::find(codec_id).unwrap();
+
+    let mut decoder_ctx = ffmpeg_next::codec::Context::new_with_codec(decoder).decoder();
+    decoder_ctx.set_parameters(codec_params).unwrap();
+
+    let mut hwctx: *mut ff::AVBufferRef = std::ptr::null_mut();
+    let ret = unsafe {
+        ff::av_hwdevice_ctx_create(
+            &mut hwctx,
+            ff::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    assert_eq!(ret, 0);
+
+    struct ProbeData {
+        hw_pix_fmt: ff::AVPixelFormat,
+        chosen_fmt: ff::AVPixelFormat,
+    }
+
+    unsafe extern "C" fn probe_get_format(
+        s: *mut ff::AVCodecContext,
+        mut fmt: *const ff::AVPixelFormat,
+    ) -> ff::AVPixelFormat {
+        let data = unsafe { ((*s).opaque as *mut ProbeData).as_mut().unwrap() };
+        eprintln!("[probe_get_format] offered formats:");
+        unsafe {
+            while (*fmt) != ff::AVPixelFormat::AV_PIX_FMT_NONE {
+                eprintln!("  format: {:?}", *fmt);
+                if *fmt == data.hw_pix_fmt {
+                    data.chosen_fmt = *fmt;
+                    return *fmt;
+                }
+                fmt = fmt.add(1);
+            }
+        }
+        ff::AVPixelFormat::AV_PIX_FMT_NONE
+    }
+
+    let mut probe_data = ProbeData {
+        hw_pix_fmt: ff::AVPixelFormat::AV_PIX_FMT_CUDA,
+        chosen_fmt: ff::AVPixelFormat::AV_PIX_FMT_NONE,
+    };
+
+    unsafe {
+        (*decoder_ctx.as_mut_ptr()).opaque = &mut probe_data as *mut _ as _;
+        (*decoder_ctx.as_mut_ptr()).get_format = Some(probe_get_format);
+        (*decoder_ctx.as_mut_ptr()).hw_device_ctx = hwctx;
+    }
+
+    let mut video_decoder = decoder_ctx.video().unwrap();
+
+    let mut packet = ffmpeg_next::Packet::empty();
+    let mut frame = ffmpeg_next::frame::Video::empty();
+
+    let mut decoded_frames = 0;
+    while packet.read(&mut input).is_ok() {
+        if packet.stream() == stream_index {
+            if video_decoder.send_packet(&packet).is_ok() {
+                while video_decoder.receive_frame(&mut frame).is_ok() {
+                    decoded_frames += 1;
+                    eprintln!(
+                        "[probe] Decoded frame {}: format={:?}, width={}, height={}",
+                        decoded_frames,
+                        unsafe { (*frame.as_ptr()).format },
+                        frame.width(),
+                        frame.height()
+                    );
+                }
+            }
+        }
+    }
+    eprintln!("[probe] Total decoded frames: {}, chosen_fmt: {:?}", decoded_frames, probe_data.chosen_fmt);
+    assert_eq!(probe_data.chosen_fmt, ff::AVPixelFormat::AV_PIX_FMT_CUDA);
+    assert!(decoded_frames > 0);
+}
