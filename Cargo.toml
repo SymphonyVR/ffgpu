@@ -18,7 +18,7 @@ video = []
 experimental-wgl-interop = []
 
 [dependencies]
-ffmpeg-next = "8.0"
+ffmpeg-next = { version = "8.0", default-features = false, features = ["format", "codec", "software-scaling", "software-resampling"] }
 thiserror = "2.0"
 wgpu = { version = "29.0", default-features = false, features = ["std", "wgsl", "parking_lot"] }
 winit = "0.29"
