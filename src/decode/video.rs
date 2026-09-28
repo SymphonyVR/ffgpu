@@ -293,6 +293,7 @@ impl Decoder {
                 );
                 log::warn!("using software decode");
                 is_hwaccel = false;
+                device_type = ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
             }
         }
 
@@ -351,7 +352,7 @@ impl Decoder {
         }
 
         let unsupported = Arc::new(AtomicBool::new(false));
-        if vaapi_fallback {
+        if vaapi_fallback || !is_hwaccel {
             unsupported.store(true, Ordering::Relaxed);
         }
         let decoder_data = if is_hwaccel {
@@ -809,6 +810,9 @@ impl VideoThread {
                         if diag_count < 20 {
                             diag_count += 1;
                             eprintln!("[VideoThread] receive_frame ERROR: {:?}", e);
+                        }
+                        if self.decoder.device_type != ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE {
+                            self.decoder.unsupported.store(true, Ordering::Relaxed);
                         }
                         // Treat like EAGAIN: without a new packet the decoder
                         // will not recover, and retrying in a tight loop here

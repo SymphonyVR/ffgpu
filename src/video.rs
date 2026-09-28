@@ -40,7 +40,13 @@ enum FrameResponse {
 #[cfg(target_os = "windows")]
 fn preferred_device_type_for_backend(backend: wgpu::Backend) -> ff::AVHWDeviceType {
     match backend {
-        wgpu::Backend::Vulkan => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+        wgpu::Backend::Vulkan => {
+            if crate::cuda_interop::is_cuda_available() {
+                ff::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA
+            } else {
+                ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN
+            }
+        }
         wgpu::Backend::Dx12 => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
         _ => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
     }
@@ -54,7 +60,13 @@ fn preferred_device_type_for_backend(_backend: wgpu::Backend) -> ff::AVHWDeviceT
 #[cfg(target_os = "linux")]
 fn preferred_device_type_for_backend(backend: wgpu::Backend) -> ff::AVHWDeviceType {
     match backend {
-        wgpu::Backend::Vulkan => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+        wgpu::Backend::Vulkan => {
+            if crate::cuda_interop::is_cuda_available() {
+                ff::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA
+            } else {
+                ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN
+            }
+        }
         _ => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
     }
 }
@@ -245,6 +257,21 @@ impl Video {
         };
         let mut hw_device_ctx = hw_device_ctx;
 
+        let mut routed_away = false;
+        if device_type == ff::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA {
+            hw_device_ctx = None;
+            let (codec_id, profile_id) =
+                unsafe { read_video_stream_profile(&mut input.format_ctx) };
+            let stream = crate::video_caps::classify(codec_id, profile_id);
+            if matches!(stream.codec, crate::video_caps::StreamCodecClass::Other) {
+                eprintln!(
+                    "[Video] CUDA NVDEC cannot decode codec_id={codec_id} ({stream:?}); falling back to software decode"
+                );
+                device_type = ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
+                routed_away = true;
+            }
+        }
+
         // Capability admission (bug-1789674498884): BEFORE handing the
         // stream to the Vulkan hwaccel, verify the device explicitly
         // reported the stream's decode profile. An admitted-but-unreported
@@ -255,8 +282,6 @@ impl Video {
         // Windows -> D3D11VA (its own probe ladder handles the rest — the
         // pre-fix logs prove D3D11VA/NVDEC decoded these exact streams);
         // elsewhere -> software. A Vulkan denial never conflates "Vulkan
-        // cannot decode this" with "no hardware decoder can".
-        let mut routed_away = false;
         if device_type == ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN {
             let (codec_id, profile_id) =
                 unsafe { read_video_stream_profile(&mut input.format_ctx) };
