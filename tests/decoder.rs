@@ -243,22 +243,119 @@ fn test_cuda_decode_tiny_mp4() {
 
     let mut decoded_frames = 0;
     while packet.read(&mut input).is_ok() {
-        if packet.stream() == stream_index {
-            if video_decoder.send_packet(&packet).is_ok() {
-                while video_decoder.receive_frame(&mut frame).is_ok() {
-                    decoded_frames += 1;
-                    eprintln!(
-                        "[probe] Decoded frame {}: format={:?}, width={}, height={}",
-                        decoded_frames,
-                        unsafe { (*frame.as_ptr()).format },
-                        frame.width(),
-                        frame.height()
-                    );
-                }
+        if packet.stream() == stream_index && video_decoder.send_packet(&packet).is_ok() {
+            while video_decoder.receive_frame(&mut frame).is_ok() {
+                decoded_frames += 1;
             }
         }
     }
-    eprintln!("[probe] Total decoded frames: {}, chosen_fmt: {:?}", decoded_frames, probe_data.chosen_fmt);
+
     assert_eq!(probe_data.chosen_fmt, ff::AVPixelFormat::AV_PIX_FMT_CUDA);
     assert!(decoded_frames > 0);
+}
+
+#[test]
+fn test_video_player_playback_crash() {
+    ffmpeg_next::init().unwrap();
+    unsafe { ffmpeg_next::sys::av_log_set_level(ffmpeg_next::sys::AV_LOG_DEBUG); }
+    let path = std::path::Path::new(r"E:\c0fa50060aaba663bab8d8bcb12b0b9b.mp4");
+    if !path.exists() {
+        return;
+    }
+
+    let instance = wgpu::Instance::default();
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+    }))
+    .expect("adapter");
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            required_features: ffgpu::required_wgpu_device_features(&adapter),
+            ..Default::default()
+        },
+    ))
+    .expect("device");
+
+    let mut ctx = ffgpu::Context::new(&instance, &adapter, &device, &queue).expect("context");
+    let (mut video, _audio) = ctx.create_video(path).expect("create_video");
+    video.set_looping(true);
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("test_encoder"),
+    });
+
+    for i in 0..100 {
+        match video.update(&mut encoder) {
+            Ok((wait, decoded)) => {
+                eprintln!("[test_playback] step {}: wait={:?}, decoded={}", i, wait, decoded);
+                if decoded {
+                    let _ = queue.submit(Some(encoder.finish()));
+                    video.release_completed_frames().unwrap();
+                    encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("test_encoder"),
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
+            Err(e) => {
+                panic!("[test_playback] step {} failed: {:?}", i, e);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_video_player_playback_yuv444() {
+    ffmpeg_next::init().unwrap();
+    let path = std::path::Path::new(r"E:\2026-05-21 14-52-15.mp4");
+    if !path.exists() {
+        return;
+    }
+
+    let instance = wgpu::Instance::default();
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+    }))
+    .expect("adapter");
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            required_features: ffgpu::required_wgpu_device_features(&adapter),
+            ..Default::default()
+        },
+    ))
+    .expect("device");
+
+    let mut ctx = ffgpu::Context::new(&instance, &adapter, &device, &queue).expect("context");
+    let (mut video, _audio) = ctx.create_video(path).expect("create_video");
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("test_encoder"),
+    });
+
+    let mut decoded_count = 0;
+    for i in 0..60 {
+        match video.update(&mut encoder) {
+            Ok((_wait, decoded)) => {
+                if decoded {
+                    decoded_count += 1;
+                    let views = video.plane_views().expect("plane_views");
+                    assert_eq!(views.len(), 3, "YUV444 must have 3 plane views");
+                    let _ = queue.submit(Some(encoder.finish()));
+                    video.release_completed_frames().unwrap();
+                    encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("test_encoder"),
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
+            Err(e) => {
+                panic!("[test_yuv444] step {} failed: {:?}", i, e);
+            }
+        }
+    }
+    assert!(decoded_count > 0, "Expected at least 1 decoded frame");
 }

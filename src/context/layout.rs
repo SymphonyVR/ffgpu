@@ -94,9 +94,32 @@ pub fn av_pixel_texture_format(
             ]),
             depth: Depth::D16, // don't apply scaling in shader
         }),
+        ff::AVPixelFormat::AV_PIX_FMT_YUV420P10LE => Some(FrameDescriptor {
+            planes: PlaneLayout::YUV420([wgpu::TextureFormat::R16Unorm; 3]),
+            depth: Depth::D10,
+        }),
         ff::AVPixelFormat::AV_PIX_FMT_YUV444P => Some(FrameDescriptor {
             planes: PlaneLayout::YUV444([wgpu::TextureFormat::R8Unorm; 3]),
             depth: Depth::D8,
+        }),
+        ff::AVPixelFormat::AV_PIX_FMT_YUV444P10LE => Some(FrameDescriptor {
+            planes: PlaneLayout::YUV444([wgpu::TextureFormat::R16Unorm; 3]),
+            depth: Depth::D10,
+        }),
+        ff::AVPixelFormat::AV_PIX_FMT_YUV444P12LE => Some(FrameDescriptor {
+            planes: PlaneLayout::YUV444([wgpu::TextureFormat::R16Unorm; 3]),
+            depth: Depth::D12,
+        }),
+        ff::AVPixelFormat::AV_PIX_FMT_YUV444P16LE => Some(FrameDescriptor {
+            planes: PlaneLayout::YUV444([wgpu::TextureFormat::R16Unorm; 3]),
+            depth: Depth::D16,
+        }),
+        ff::AVPixelFormat::AV_PIX_FMT_P016LE => Some(FrameDescriptor {
+            planes: PlaneLayout::PackedYUV420([
+                wgpu::TextureFormat::R16Unorm,
+                wgpu::TextureFormat::Rg16Unorm,
+            ]),
+            depth: Depth::D16,
         }),
         _ => None,
     }

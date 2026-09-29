@@ -40,24 +40,35 @@ struct ExportedDirectPlane {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+struct DirectPlane {
+    plane: ExportedDirectPlane,
+    width_in_bytes: usize,
+    height: usize,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 struct DirectPlanes {
-    plane_y: ExportedDirectPlane,
-    plane_uv: ExportedDirectPlane,
+    planes: Vec<DirectPlane>,
     bg0: wgpu::BindGroup,
     layout: layout::FrameDescriptor<()>,
     driver: &'static CudaDriver,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+struct HostDmaPlane {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    host_buf: *mut c_void,
+    host_buf_size: usize,
+    width_in_bytes: usize,
+    height: usize,
+    tex_width: u32,
+    tex_height: u32,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 struct HostDmaPlanes {
-    texture_y: wgpu::Texture,
-    view_y: wgpu::TextureView,
-    texture_uv: wgpu::Texture,
-    view_uv: wgpu::TextureView,
-    host_buf_y: *mut c_void,
-    host_buf_y_size: usize,
-    host_buf_uv: *mut c_void,
-    host_buf_uv_size: usize,
+    planes: Vec<HostDmaPlane>,
     bg0: wgpu::BindGroup,
     layout: layout::FrameDescriptor<()>,
     driver: &'static CudaDriver,
@@ -79,25 +90,20 @@ impl Drop for CudaPlanes {
     fn drop(&mut self) {
         match self {
             CudaPlanes::Direct(d) => unsafe {
-                if !d.plane_y.mipmapped_array.is_null() {
-                    (d.driver.cu_mipmapped_array_destroy)(d.plane_y.mipmapped_array);
-                }
-                if !d.plane_y.ext_mem.is_null() {
-                    (d.driver.cu_destroy_external_memory)(d.plane_y.ext_mem);
-                }
-                if !d.plane_uv.mipmapped_array.is_null() {
-                    (d.driver.cu_mipmapped_array_destroy)(d.plane_uv.mipmapped_array);
-                }
-                if !d.plane_uv.ext_mem.is_null() {
-                    (d.driver.cu_destroy_external_memory)(d.plane_uv.ext_mem);
+                for p in &d.planes {
+                    if !p.plane.mipmapped_array.is_null() {
+                        (d.driver.cu_mipmapped_array_destroy)(p.plane.mipmapped_array);
+                    }
+                    if !p.plane.ext_mem.is_null() {
+                        (d.driver.cu_destroy_external_memory)(p.plane.ext_mem);
+                    }
                 }
             },
             CudaPlanes::HostDma(h) => unsafe {
-                if !h.host_buf_y.is_null() {
-                    (h.driver.cu_mem_free_host)(h.host_buf_y);
-                }
-                if !h.host_buf_uv.is_null() {
-                    (h.driver.cu_mem_free_host)(h.host_buf_uv);
+                for p in &h.planes {
+                    if !p.host_buf.is_null() {
+                        (h.driver.cu_mem_free_host)(p.host_buf);
+                    }
                 }
             },
         }
@@ -356,63 +362,174 @@ impl CudaPlanes {
         adapter: &wgpu::Adapter,
         width: u32,
         height: u32,
-        is_p010: bool,
+        sw_format: ff::AVPixelFormat,
         colorspace: ff::AVColorSpace,
         driver: &'static CudaDriver,
         pipeline_cache: &mut PipelineCache,
     ) -> Result<Self> {
-        let (fmt_y, fmt_uv, depth) = if is_p010 {
-            (
-                wgpu::TextureFormat::R16Unorm,
-                wgpu::TextureFormat::Rg16Unorm,
-                layout::Depth::D16,
-            )
-        } else {
-            (
-                wgpu::TextureFormat::R8Unorm,
-                wgpu::TextureFormat::Rg8Unorm,
-                layout::Depth::D8,
-            )
+        let descriptor = layout::av_pixel_texture_format(sw_format)
+            .ok_or(Error::UnsupportedPixelFormat)?;
+
+        let bytes_per_channel = match descriptor.depth {
+            layout::Depth::D8 => 1,
+            layout::Depth::D10 | layout::Depth::D12 | layout::Depth::D16 => 2,
         };
 
         // 1. Try Tier 1: True Zero-Copy (VRAM)
         let direct_res: Result<DirectPlanes> = (|| unsafe {
-            let plane_y = create_exported_direct_plane(
-                device,
-                adapter,
-                width,
-                height,
-                fmt_y,
-                "CUDA Zero-Copy Plane Y",
-                driver,
-            )?;
-            let plane_uv = create_exported_direct_plane(
-                device,
-                adapter,
-                width / 2,
-                height / 2,
-                fmt_uv,
-                "CUDA Zero-Copy Plane UV",
-                driver,
-            )?;
-            let plane_views = layout::PlaneLayout::PackedYUV420([
-                plane_y.view.clone(),
-                plane_uv.view.clone(),
-            ]);
+            let mut direct_planes = Vec::new();
+            let plane_views = match descriptor.planes {
+                layout::PlaneLayout::PackedYUV420([fmt_y, fmt_uv]) => {
+                    let py = create_exported_direct_plane(
+                        device,
+                        adapter,
+                        width,
+                        height,
+                        fmt_y,
+                        "CUDA Zero-Copy Plane Y",
+                        driver,
+                    )?;
+                    let puv = create_exported_direct_plane(
+                        device,
+                        adapter,
+                        width / 2,
+                        height / 2,
+                        fmt_uv,
+                        "CUDA Zero-Copy Plane UV",
+                        driver,
+                    )?;
+                    let views = layout::PlaneLayout::PackedYUV420([
+                        py.view.clone(),
+                        puv.view.clone(),
+                    ]);
+                    direct_planes.push(DirectPlane {
+                        plane: py,
+                        width_in_bytes: (width as usize) * bytes_per_channel,
+                        height: height as usize,
+                    });
+                    direct_planes.push(DirectPlane {
+                        plane: puv,
+                        width_in_bytes: (width as usize) * bytes_per_channel,
+                        height: (height / 2) as usize,
+                    });
+                    views
+                }
+                layout::PlaneLayout::YUV420([fmt_y, fmt_u, fmt_v]) => {
+                    let py = create_exported_direct_plane(
+                        device,
+                        adapter,
+                        width,
+                        height,
+                        fmt_y,
+                        "CUDA Zero-Copy Plane Y",
+                        driver,
+                    )?;
+                    let pu = create_exported_direct_plane(
+                        device,
+                        adapter,
+                        width / 2,
+                        height / 2,
+                        fmt_u,
+                        "CUDA Zero-Copy Plane U",
+                        driver,
+                    )?;
+                    let pv = create_exported_direct_plane(
+                        device,
+                        adapter,
+                        width / 2,
+                        height / 2,
+                        fmt_v,
+                        "CUDA Zero-Copy Plane V",
+                        driver,
+                    )?;
+                    let views = layout::PlaneLayout::YUV420([
+                        py.view.clone(),
+                        pu.view.clone(),
+                        pv.view.clone(),
+                    ]);
+                    direct_planes.push(DirectPlane {
+                        plane: py,
+                        width_in_bytes: (width as usize) * bytes_per_channel,
+                        height: height as usize,
+                    });
+                    direct_planes.push(DirectPlane {
+                        plane: pu,
+                        width_in_bytes: ((width / 2) as usize) * bytes_per_channel,
+                        height: (height / 2) as usize,
+                    });
+                    direct_planes.push(DirectPlane {
+                        plane: pv,
+                        width_in_bytes: ((width / 2) as usize) * bytes_per_channel,
+                        height: (height / 2) as usize,
+                    });
+                    views
+                }
+                layout::PlaneLayout::YUV444([fmt_y, fmt_u, fmt_v]) => {
+                    let py = create_exported_direct_plane(
+                        device,
+                        adapter,
+                        width,
+                        height,
+                        fmt_y,
+                        "CUDA Zero-Copy Plane Y",
+                        driver,
+                    )?;
+                    let pu = create_exported_direct_plane(
+                        device,
+                        adapter,
+                        width,
+                        height,
+                        fmt_u,
+                        "CUDA Zero-Copy Plane U",
+                        driver,
+                    )?;
+                    let pv = create_exported_direct_plane(
+                        device,
+                        adapter,
+                        width,
+                        height,
+                        fmt_v,
+                        "CUDA Zero-Copy Plane V",
+                        driver,
+                    )?;
+                    let views = layout::PlaneLayout::YUV444([
+                        py.view.clone(),
+                        pu.view.clone(),
+                        pv.view.clone(),
+                    ]);
+                    direct_planes.push(DirectPlane {
+                        plane: py,
+                        width_in_bytes: (width as usize) * bytes_per_channel,
+                        height: height as usize,
+                    });
+                    direct_planes.push(DirectPlane {
+                        plane: pu,
+                        width_in_bytes: (width as usize) * bytes_per_channel,
+                        height: height as usize,
+                    });
+                    direct_planes.push(DirectPlane {
+                        plane: pv,
+                        width_in_bytes: (width as usize) * bytes_per_channel,
+                        height: height as usize,
+                    });
+                    views
+                }
+                layout::PlaneLayout::RGB(_) => return Err(Error::UnsupportedPixelFormat),
+            };
+
             let bg0 = pipeline_cache.bind_frame_textures(
                 &layout::FrameDescriptor {
                     planes: plane_views,
-                    depth,
+                    depth: descriptor.depth,
                 },
                 colorspace.into(),
             );
             let layout = layout::FrameDescriptor {
-                planes: layout::PlaneLayout::PackedYUV420([(), ()]),
-                depth,
+                planes: descriptor.planes.as_identity(),
+                depth: descriptor.depth,
             };
             Ok(DirectPlanes {
-                plane_y,
-                plane_uv,
+                planes: direct_planes,
                 bg0,
                 layout,
                 driver,
@@ -427,89 +544,195 @@ impl CudaPlanes {
         // 2. Fall back to Tier 2: Pinned Host DMA
         eprintln!("[CUDA-NVDEC] Tier 1 external memory unavailable; falling back to Tier 2 Pinned Host DMA");
 
-        let texture_y = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("CUDA NVDEC Plane Y"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: fmt_y,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let view_y = texture_y.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut host_planes = Vec::new();
 
-        let texture_uv = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("CUDA NVDEC Plane UV"),
-            size: wgpu::Extent3d {
-                width: width / 2,
-                height: height / 2,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: fmt_uv,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let view_uv = texture_uv.create_view(&wgpu::TextureViewDescriptor::default());
+        let create_plane = |tex_w: u32,
+                            tex_h: u32,
+                            fmt: wgpu::TextureFormat,
+                            channels: usize,
+                            label: &str|
+         -> Result<HostDmaPlane> {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: tex_w,
+                    height: tex_h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: fmt,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let bytes_per_elem = if is_p010 { 2 } else { 1 };
-        let host_buf_y_size = (width as usize) * (height as usize) * bytes_per_elem;
-        let host_buf_uv_size = (width as usize) * ((height / 2) as usize) * bytes_per_elem;
+            let width_in_bytes = (tex_w as usize) * channels * bytes_per_channel;
+            let height_lines = tex_h as usize;
+            let host_buf_size = width_in_bytes * height_lines;
 
-        let mut host_buf_y: *mut c_void = std::ptr::null_mut();
-        let mut host_buf_uv: *mut c_void = std::ptr::null_mut();
-
-        let _ = unsafe { (driver.cu_ctx_set_current)(driver.primary_ctx) };
-
-        let res = unsafe { (driver.cu_mem_alloc_host)(&mut host_buf_y, host_buf_y_size) };
-        if res != CUDA_SUCCESS || host_buf_y.is_null() {
-            eprintln!("[CUDA-NVDEC] cuMemAllocHost for Y failed: {:?}", res);
-            return Err(Error::HardwareContext);
-        }
-
-        let res = unsafe { (driver.cu_mem_alloc_host)(&mut host_buf_uv, host_buf_uv_size) };
-        if res != CUDA_SUCCESS || host_buf_uv.is_null() {
-            eprintln!("[CUDA-NVDEC] cuMemAllocHost for UV failed: {:?}", res);
-            unsafe {
-                (driver.cu_mem_free_host)(host_buf_y);
+            let mut host_buf: *mut c_void = std::ptr::null_mut();
+            let _ = unsafe { (driver.cu_ctx_set_current)(driver.primary_ctx) };
+            let res = unsafe { (driver.cu_mem_alloc_host)(&mut host_buf, host_buf_size) };
+            if res != CUDA_SUCCESS || host_buf.is_null() {
+                eprintln!("[CUDA-NVDEC] cuMemAllocHost for {} failed: {:?}", label, res);
+                return Err(Error::HardwareContext);
             }
-            return Err(Error::HardwareContext);
-        }
 
-        let plane_views = layout::PlaneLayout::PackedYUV420([
-            view_y.clone(),
-            view_uv.clone(),
-        ]);
+            Ok(HostDmaPlane {
+                texture,
+                view,
+                host_buf,
+                host_buf_size,
+                width_in_bytes,
+                height: height_lines,
+                tex_width: tex_w,
+                tex_height: tex_h,
+            })
+        };
+
+        let plane_views = match descriptor.planes {
+            layout::PlaneLayout::PackedYUV420([fmt_y, fmt_uv]) => {
+                let py = match create_plane(width, height, fmt_y, 1, "CUDA NVDEC Plane Y") {
+                    Ok(p) => p,
+                    Err(e) => return Err(e),
+                };
+                let puv = match create_plane(
+                    width / 2,
+                    height / 2,
+                    fmt_uv,
+                    2,
+                    "CUDA NVDEC Plane UV",
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        unsafe {
+                            if !py.host_buf.is_null() {
+                                (driver.cu_mem_free_host)(py.host_buf);
+                            }
+                        }
+                        return Err(e);
+                    }
+                };
+                let views = layout::PlaneLayout::PackedYUV420([
+                    py.view.clone(),
+                    puv.view.clone(),
+                ]);
+                host_planes.push(py);
+                host_planes.push(puv);
+                views
+            }
+            layout::PlaneLayout::YUV420([fmt_y, fmt_u, fmt_v]) => {
+                let py = match create_plane(width, height, fmt_y, 1, "CUDA NVDEC Plane Y") {
+                    Ok(p) => p,
+                    Err(e) => return Err(e),
+                };
+                let pu = match create_plane(
+                    width / 2,
+                    height / 2,
+                    fmt_u,
+                    1,
+                    "CUDA NVDEC Plane U",
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        unsafe {
+                            if !py.host_buf.is_null() {
+                                (driver.cu_mem_free_host)(py.host_buf);
+                            }
+                        }
+                        return Err(e);
+                    }
+                };
+                let pv = match create_plane(
+                    width / 2,
+                    height / 2,
+                    fmt_v,
+                    1,
+                    "CUDA NVDEC Plane V",
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        unsafe {
+                            if !py.host_buf.is_null() {
+                                (driver.cu_mem_free_host)(py.host_buf);
+                            }
+                            if !pu.host_buf.is_null() {
+                                (driver.cu_mem_free_host)(pu.host_buf);
+                            }
+                        }
+                        return Err(e);
+                    }
+                };
+                let views = layout::PlaneLayout::YUV420([
+                    py.view.clone(),
+                    pu.view.clone(),
+                    pv.view.clone(),
+                ]);
+                host_planes.push(py);
+                host_planes.push(pu);
+                host_planes.push(pv);
+                views
+            }
+            layout::PlaneLayout::YUV444([fmt_y, fmt_u, fmt_v]) => {
+                let py = match create_plane(width, height, fmt_y, 1, "CUDA NVDEC Plane Y") {
+                    Ok(p) => p,
+                    Err(e) => return Err(e),
+                };
+                let pu = match create_plane(width, height, fmt_u, 1, "CUDA NVDEC Plane U") {
+                    Ok(p) => p,
+                    Err(e) => {
+                        unsafe {
+                            if !py.host_buf.is_null() {
+                                (driver.cu_mem_free_host)(py.host_buf);
+                            }
+                        }
+                        return Err(e);
+                    }
+                };
+                let pv = match create_plane(width, height, fmt_v, 1, "CUDA NVDEC Plane V") {
+                    Ok(p) => p,
+                    Err(e) => {
+                        unsafe {
+                            if !py.host_buf.is_null() {
+                                (driver.cu_mem_free_host)(py.host_buf);
+                            }
+                            if !pu.host_buf.is_null() {
+                                (driver.cu_mem_free_host)(pu.host_buf);
+                            }
+                        }
+                        return Err(e);
+                    }
+                };
+                let views = layout::PlaneLayout::YUV444([
+                    py.view.clone(),
+                    pu.view.clone(),
+                    pv.view.clone(),
+                ]);
+                host_planes.push(py);
+                host_planes.push(pu);
+                host_planes.push(pv);
+                views
+            }
+            layout::PlaneLayout::RGB(_) => return Err(Error::UnsupportedPixelFormat),
+        };
 
         let bg0 = pipeline_cache.bind_frame_textures(
             &layout::FrameDescriptor {
                 planes: plane_views,
-                depth,
+                depth: descriptor.depth,
             },
             colorspace.into(),
         );
 
         let layout = layout::FrameDescriptor {
-            planes: layout::PlaneLayout::PackedYUV420([(), ()]),
-            depth,
+            planes: descriptor.planes.as_identity(),
+            depth: descriptor.depth,
         };
 
         Ok(CudaPlanes::HostDma(HostDmaPlanes {
-            texture_y,
-            view_y,
-            texture_uv,
-            view_uv,
-            host_buf_y,
-            host_buf_y_size,
-            host_buf_uv,
-            host_buf_uv_size,
+            planes: host_planes,
             bg0,
             layout,
             driver,
@@ -525,7 +748,8 @@ pub struct CudaZeroCopyFrameAdapter {
     planes: Option<CudaPlanes>,
     width: u32,
     height: u32,
-    is_p010: bool,
+    sw_format: ff::AVPixelFormat,
+    colorspace: ff::AVColorSpace,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -551,7 +775,8 @@ impl FrameAdapterBuilder for CudaZeroCopyFrameAdapter {
             planes: None,
             width,
             height,
-            is_p010: false,
+            sw_format: ff::AVPixelFormat::AV_PIX_FMT_NONE,
+            colorspace: ff::AVColorSpace::AVCOL_SPC_UNSPECIFIED,
         })
     }
 
@@ -574,22 +799,36 @@ impl FrameAdapter for CudaZeroCopyFrameAdapter {
     ) -> Result<Option<GlInteropTicket>> {
         let frame_ref = unsafe { frame.as_ref() };
 
-        let is_p010 = if !frame_ref.hw_frames_ctx.is_null() {
+        let sw_format = if !frame_ref.hw_frames_ctx.is_null() {
             unsafe {
                 let hwctx = (*frame_ref.hw_frames_ctx).data as *mut ff::AVHWFramesContext;
-                (*hwctx).sw_format == ff::AVPixelFormat::AV_PIX_FMT_P010LE
+                (*hwctx).sw_format
+            }
+        } else if unsafe { !(*self._decoder.as_ptr()).hw_frames_ctx.is_null() } {
+            unsafe {
+                let hwctx =
+                    (*(*self._decoder.as_ptr()).hw_frames_ctx).data as *mut ff::AVHWFramesContext;
+                (*hwctx).sw_format
             }
         } else {
-            false
+            unsafe { (*self._decoder.as_ptr()).sw_pix_fmt }
+        };
+
+        let sw_format = if sw_format == ff::AVPixelFormat::AV_PIX_FMT_NONE {
+            ff::AVPixelFormat::AV_PIX_FMT_NV12
+        } else {
+            sw_format
         };
 
         let width = frame_ref.width as u32;
         let height = frame_ref.height as u32;
+        let colorspace = frame_ref.colorspace;
 
         if self.planes.is_none()
             || self.width != width
             || self.height != height
-            || self.is_p010 != is_p010
+            || self.sw_format != sw_format
+            || self.colorspace != colorspace
         {
             // Drop old planes if any
             self.planes = None;
@@ -599,8 +838,8 @@ impl FrameAdapter for CudaZeroCopyFrameAdapter {
                 adapter,
                 width,
                 height,
-                is_p010,
-                frame_ref.colorspace,
+                sw_format,
+                colorspace,
                 self.driver,
                 pipeline_cache,
             )?;
@@ -608,66 +847,42 @@ impl FrameAdapter for CudaZeroCopyFrameAdapter {
             self.planes = Some(planes);
             self.width = width;
             self.height = height;
-            self.is_p010 = is_p010;
+            self.sw_format = sw_format;
+            self.colorspace = colorspace;
         }
 
         let planes = self.planes.as_ref().unwrap();
-        let bytes_per_elem = if is_p010 { 2 } else { 1 };
 
         let _ = unsafe { (self.driver.cu_ctx_set_current)(self.driver.primary_ctx) };
 
         match planes {
             CudaPlanes::Direct(d) => {
-                let copy_y = CUDA_MEMCPY2D {
-                    src_x_in_bytes: 0,
-                    src_y: 0,
-                    src_memory_type: CUmemorytype::Device,
-                    src_host: std::ptr::null(),
-                    src_device: frame_ref.data[0] as u64,
-                    src_array: std::ptr::null_mut(),
-                    src_pitch: frame_ref.linesize[0] as usize,
+                for (i, p) in d.planes.iter().enumerate() {
+                    let copy = CUDA_MEMCPY2D {
+                        src_x_in_bytes: 0,
+                        src_y: 0,
+                        src_memory_type: CUmemorytype::Device,
+                        src_host: std::ptr::null(),
+                        src_device: frame_ref.data[i] as u64,
+                        src_array: std::ptr::null_mut(),
+                        src_pitch: frame_ref.linesize[i] as usize,
 
-                    dst_x_in_bytes: 0,
-                    dst_y: 0,
-                    dst_memory_type: CUmemorytype::Array,
-                    dst_host: std::ptr::null_mut(),
-                    dst_device: 0,
-                    dst_array: d.plane_y.cu_array,
-                    dst_pitch: 0,
+                        dst_x_in_bytes: 0,
+                        dst_y: 0,
+                        dst_memory_type: CUmemorytype::Array,
+                        dst_host: std::ptr::null_mut(),
+                        dst_device: 0,
+                        dst_array: p.plane.cu_array,
+                        dst_pitch: 0,
 
-                    width_in_bytes: (width as usize) * bytes_per_elem,
-                    height: height as usize,
-                };
-                let res = unsafe { (self.driver.cu_memcpy_2d_async)(&copy_y, self.stream) };
-                if res != CUDA_SUCCESS {
-                    eprintln!("[CUDA-NVDEC] cuMemcpy2DAsync direct Y failed: {:?}", res);
-                    return Err(Error::HardwareContext);
-                }
-
-                let copy_uv = CUDA_MEMCPY2D {
-                    src_x_in_bytes: 0,
-                    src_y: 0,
-                    src_memory_type: CUmemorytype::Device,
-                    src_host: std::ptr::null(),
-                    src_device: frame_ref.data[1] as u64,
-                    src_array: std::ptr::null_mut(),
-                    src_pitch: frame_ref.linesize[1] as usize,
-
-                    dst_x_in_bytes: 0,
-                    dst_y: 0,
-                    dst_memory_type: CUmemorytype::Array,
-                    dst_host: std::ptr::null_mut(),
-                    dst_device: 0,
-                    dst_array: d.plane_uv.cu_array,
-                    dst_pitch: 0,
-
-                    width_in_bytes: (width as usize) * bytes_per_elem,
-                    height: (height / 2) as usize,
-                };
-                let res = unsafe { (self.driver.cu_memcpy_2d_async)(&copy_uv, self.stream) };
-                if res != CUDA_SUCCESS {
-                    eprintln!("[CUDA-NVDEC] cuMemcpy2DAsync direct UV failed: {:?}", res);
-                    return Err(Error::HardwareContext);
+                        width_in_bytes: p.width_in_bytes,
+                        height: p.height,
+                    };
+                    let res = unsafe { (self.driver.cu_memcpy_2d_async)(&copy, self.stream) };
+                    if res != CUDA_SUCCESS {
+                        eprintln!("[CUDA-NVDEC] cuMemcpy2DAsync direct plane {} failed: {:?}", i, res);
+                        return Err(Error::HardwareContext);
+                    }
                 }
 
                 let res = unsafe { (self.driver.cu_stream_synchronize)(self.stream) };
@@ -677,56 +892,32 @@ impl FrameAdapter for CudaZeroCopyFrameAdapter {
                 }
             }
             CudaPlanes::HostDma(h) => {
-                let copy_y = CUDA_MEMCPY2D {
-                    src_x_in_bytes: 0,
-                    src_y: 0,
-                    src_memory_type: CUmemorytype::Device,
-                    src_host: std::ptr::null(),
-                    src_device: frame_ref.data[0] as u64,
-                    src_array: std::ptr::null_mut(),
-                    src_pitch: frame_ref.linesize[0] as usize,
+                for (i, p) in h.planes.iter().enumerate() {
+                    let copy = CUDA_MEMCPY2D {
+                        src_x_in_bytes: 0,
+                        src_y: 0,
+                        src_memory_type: CUmemorytype::Device,
+                        src_host: std::ptr::null(),
+                        src_device: frame_ref.data[i] as u64,
+                        src_array: std::ptr::null_mut(),
+                        src_pitch: frame_ref.linesize[i] as usize,
 
-                    dst_x_in_bytes: 0,
-                    dst_y: 0,
-                    dst_memory_type: CUmemorytype::Host,
-                    dst_host: h.host_buf_y,
-                    dst_device: 0,
-                    dst_array: std::ptr::null_mut(),
-                    dst_pitch: (width as usize) * bytes_per_elem,
+                        dst_x_in_bytes: 0,
+                        dst_y: 0,
+                        dst_memory_type: CUmemorytype::Host,
+                        dst_host: p.host_buf,
+                        dst_device: 0,
+                        dst_array: std::ptr::null_mut(),
+                        dst_pitch: p.width_in_bytes,
 
-                    width_in_bytes: (width as usize) * bytes_per_elem,
-                    height: height as usize,
-                };
-                let res = unsafe { (self.driver.cu_memcpy_2d_async)(&copy_y, self.stream) };
-                if res != CUDA_SUCCESS {
-                    eprintln!("[CUDA-NVDEC] cuMemcpy2DAsync for Y plane failed: {:?}", res);
-                    return Err(Error::HardwareContext);
-                }
-
-                let copy_uv = CUDA_MEMCPY2D {
-                    src_x_in_bytes: 0,
-                    src_y: 0,
-                    src_memory_type: CUmemorytype::Device,
-                    src_host: std::ptr::null(),
-                    src_device: frame_ref.data[1] as u64,
-                    src_array: std::ptr::null_mut(),
-                    src_pitch: frame_ref.linesize[1] as usize,
-
-                    dst_x_in_bytes: 0,
-                    dst_y: 0,
-                    dst_memory_type: CUmemorytype::Host,
-                    dst_host: h.host_buf_uv,
-                    dst_device: 0,
-                    dst_array: std::ptr::null_mut(),
-                    dst_pitch: (width as usize) * bytes_per_elem,
-
-                    width_in_bytes: (width as usize) * bytes_per_elem,
-                    height: (height / 2) as usize,
-                };
-                let res = unsafe { (self.driver.cu_memcpy_2d_async)(&copy_uv, self.stream) };
-                if res != CUDA_SUCCESS {
-                    eprintln!("[CUDA-NVDEC] cuMemcpy2DAsync for UV plane failed: {:?}", res);
-                    return Err(Error::HardwareContext);
+                        width_in_bytes: p.width_in_bytes,
+                        height: p.height,
+                    };
+                    let res = unsafe { (self.driver.cu_memcpy_2d_async)(&copy, self.stream) };
+                    if res != CUDA_SUCCESS {
+                        eprintln!("[CUDA-NVDEC] cuMemcpy2DAsync for plane {} failed: {:?}", i, res);
+                        return Err(Error::HardwareContext);
+                    }
                 }
 
                 let res = unsafe { (self.driver.cu_stream_synchronize)(self.stream) };
@@ -735,55 +926,32 @@ impl FrameAdapter for CudaZeroCopyFrameAdapter {
                     return Err(Error::HardwareContext);
                 }
 
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &h.texture_y,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    unsafe {
-                        std::slice::from_raw_parts(
-                            h.host_buf_y as *const u8,
-                            h.host_buf_y_size,
-                        )
-                    },
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some((width * bytes_per_elem as u32) as _),
-                        rows_per_image: None,
-                    },
-                    wgpu::Extent3d {
-                        width,
-                        height,
-                        depth_or_array_layers: 1,
-                    },
-                );
-
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &h.texture_uv,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    unsafe {
-                        std::slice::from_raw_parts(
-                            h.host_buf_uv as *const u8,
-                            h.host_buf_uv_size,
-                        )
-                    },
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some((width * bytes_per_elem as u32) as _),
-                        rows_per_image: None,
-                    },
-                    wgpu::Extent3d {
-                        width: width / 2,
-                        height: height / 2,
-                        depth_or_array_layers: 1,
-                    },
-                );
+                for p in &h.planes {
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &p.texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        unsafe {
+                            std::slice::from_raw_parts(
+                                p.host_buf as *const u8,
+                                p.host_buf_size,
+                            )
+                        },
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(p.width_in_bytes as u32),
+                            rows_per_image: None,
+                        },
+                        wgpu::Extent3d {
+                            width: p.tex_width,
+                            height: p.tex_height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
             }
         }
 
@@ -814,8 +982,8 @@ impl FrameAdapter for CudaZeroCopyFrameAdapter {
 
     fn plane_views(&self) -> Option<Vec<wgpu::TextureView>> {
         self.planes.as_ref().map(|p| match p {
-            CudaPlanes::Direct(d) => vec![d.plane_y.view.clone(), d.plane_uv.view.clone()],
-            CudaPlanes::HostDma(h) => vec![h.view_y.clone(), h.view_uv.clone()],
+            CudaPlanes::Direct(d) => d.planes.iter().map(|p| p.plane.view.clone()).collect(),
+            CudaPlanes::HostDma(h) => h.planes.iter().map(|p| p.view.clone()).collect(),
         })
     }
 }

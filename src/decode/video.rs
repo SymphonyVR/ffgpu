@@ -330,8 +330,8 @@ impl Decoder {
         //   (per-codec thread counts, dav1d options for AV1, AV_CODEC_FLAG2_FAST).
         if is_hwaccel {
             decoder_ctx.set_threading(ffn::threading::Config {
-                kind: ffn::threading::Type::Frame,
-                count: 0,
+                kind: ffn::threading::Type::None,
+                count: 1,
             });
         } else {
             // Software path: configure explicit multi-threading before open.
