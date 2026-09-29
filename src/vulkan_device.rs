@@ -48,6 +48,8 @@ const OPTIONAL_FFMPEG_EXTENSIONS: &[&std::ffi::CStr] = &[
     c"VK_KHR_shader_relaxed_extended_instruction",
     c"VK_KHR_external_memory_fd",
     c"VK_KHR_external_semaphore_fd",
+    c"VK_KHR_external_memory_win32",
+    c"VK_KHR_external_semaphore_win32",
     c"VK_EXT_external_memory_host",
     c"VK_EXT_external_memory_dma_buf",
     c"VK_EXT_image_drm_format_modifier",

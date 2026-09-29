@@ -17,12 +17,14 @@ use crate::{
     },
     decode::frames::{FrameAdapter, FrameAdapterBuilder, GlInteropTicket},
 };
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::cuda_interop::{
     CUDA_ARRAY3D_DESCRIPTOR, CUDA_EXTERNAL_MEMORY_HANDLE_DESC,
     CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC, CUarray_format,
     CUexternalMemoryHandle, CUexternalMemoryHandleType,
 };
+#[cfg(target_os = "windows")]
+use crate::cuda_interop::CUexternalMemoryHandleWin32;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use ffmpeg_next::sys as ff;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -110,7 +112,7 @@ impl Drop for CudaPlanes {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 unsafe fn create_exported_direct_plane(
     device: &wgpu::Device,
     adapter: &wgpu::Adapter,
@@ -142,8 +144,13 @@ unsafe fn create_exported_direct_plane(
         _ => return Err(Error::UnsupportedPixelFormat),
     };
 
+    #[cfg(target_os = "linux")]
+    let handle_type = vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD;
+    #[cfg(target_os = "windows")]
+    let handle_type = vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32_KMT;
+
     let mut external_image_info = vk::ExternalMemoryImageCreateInfo::default()
-        .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+        .handle_types(handle_type);
 
     let image_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
@@ -187,7 +194,7 @@ unsafe fn create_exported_direct_plane(
         .image(vk_image);
 
     let mut export_info = vk::ExportMemoryAllocateInfo::default()
-        .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+        .handle_types(handle_type);
 
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
@@ -209,38 +216,83 @@ unsafe fn create_exported_direct_plane(
         return Err(Error::UnsupportedBackend);
     }
 
-    let ext_fd_loader = ash::khr::external_memory_fd::Device::new(raw_instance, raw_device);
-    let get_fd_info = vk::MemoryGetFdInfoKHR::default()
-        .memory(device_memory)
-        .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+    #[cfg(target_os = "linux")]
+    let ext_mem = {
+        let ext_fd_loader = ash::khr::external_memory_fd::Device::new(raw_instance, raw_device);
+        let get_fd_info = vk::MemoryGetFdInfoKHR::default()
+            .memory(device_memory)
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
 
-    let fd = match ext_fd_loader.get_memory_fd(&get_fd_info) {
-        Ok(fd) => fd,
-        Err(_) => {
+        let fd = match ext_fd_loader.get_memory_fd(&get_fd_info) {
+            Ok(fd) => fd,
+            Err(_) => {
+                raw_device.free_memory(device_memory, None);
+                raw_device.destroy_image(vk_image, None);
+                return Err(Error::UnsupportedBackend);
+            }
+        };
+
+        let handle_desc = CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
+            handle_type: CUexternalMemoryHandleType::OpaqueFd,
+            handle: CUexternalMemoryHandle { fd },
+            size: mem_reqs.size,
+            flags: 0,
+            reserved: [0; 16],
+        };
+
+        let _ = (driver.cu_ctx_set_current)(driver.primary_ctx);
+        let mut ext_mem: CUexternalMemory = std::ptr::null_mut();
+        let cu_res = (driver.cu_import_external_memory)(&mut ext_mem, &handle_desc);
+        libc::close(fd);
+
+        if cu_res != CUDA_SUCCESS || ext_mem.is_null() {
             raw_device.free_memory(device_memory, None);
             raw_device.destroy_image(vk_image, None);
-            return Err(Error::UnsupportedBackend);
+            return Err(Error::HardwareContext);
         }
+        ext_mem
     };
 
-    let handle_desc = CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
-        handle_type: CUexternalMemoryHandleType::OpaqueFd,
-        handle: CUexternalMemoryHandle { fd },
-        size: mem_reqs.size,
-        flags: 0,
-        reserved: [0; 16],
+    #[cfg(target_os = "windows")]
+    let ext_mem = {
+        let ext_win32_loader = ash::khr::external_memory_win32::Device::new(raw_instance, raw_device);
+        let get_win32_info = vk::MemoryGetWin32HandleInfoKHR::default()
+            .memory(device_memory)
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32_KMT);
+
+        let win32_handle = match ext_win32_loader.get_memory_win32_handle(&get_win32_info) {
+            Ok(h) => h,
+            Err(_) => {
+                raw_device.free_memory(device_memory, None);
+                raw_device.destroy_image(vk_image, None);
+                return Err(Error::UnsupportedBackend);
+            }
+        };
+
+        let handle_desc = CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
+            handle_type: CUexternalMemoryHandleType::OpaqueWin32Kmt,
+            handle: CUexternalMemoryHandle {
+                win32: CUexternalMemoryHandleWin32 {
+                    handle: win32_handle as *mut c_void,
+                    name: std::ptr::null(),
+                },
+            },
+            size: mem_reqs.size,
+            flags: 0,
+            reserved: [0; 16],
+        };
+
+        let _ = (driver.cu_ctx_set_current)(driver.primary_ctx);
+        let mut ext_mem: CUexternalMemory = std::ptr::null_mut();
+        let cu_res = (driver.cu_import_external_memory)(&mut ext_mem, &handle_desc);
+
+        if cu_res != CUDA_SUCCESS || ext_mem.is_null() {
+            raw_device.free_memory(device_memory, None);
+            raw_device.destroy_image(vk_image, None);
+            return Err(Error::HardwareContext);
+        }
+        ext_mem
     };
-
-    let _ = (driver.cu_ctx_set_current)(driver.primary_ctx);
-    let mut ext_mem: CUexternalMemory = std::ptr::null_mut();
-    let cu_res = (driver.cu_import_external_memory)(&mut ext_mem, &handle_desc);
-    libc::close(fd);
-
-    if cu_res != CUDA_SUCCESS || ext_mem.is_null() {
-        raw_device.free_memory(device_memory, None);
-        raw_device.destroy_image(vk_image, None);
-        return Err(Error::HardwareContext);
-    }
 
     let (cuda_fmt, channels) = match format {
         wgpu::TextureFormat::R8Unorm => (CUarray_format::UnsignedInt8, 1),
@@ -342,7 +394,7 @@ unsafe fn create_exported_direct_plane(
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 unsafe fn create_exported_direct_plane(
     _device: &wgpu::Device,
     _adapter: &wgpu::Adapter,
