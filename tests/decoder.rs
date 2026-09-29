@@ -359,3 +359,113 @@ fn test_video_player_playback_yuv444() {
     }
     assert!(decoded_count > 0, "Expected at least 1 decoded frame");
 }
+
+#[test]
+fn test_video_player_playback_hevc_10bit() {
+    ffmpeg_next::init().unwrap();
+    let path = std::path::Path::new(r"E:\OP darkins.mov");
+    if !path.exists() {
+        return;
+    }
+
+    let instance = wgpu::Instance::default();
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+    }))
+    .expect("adapter");
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            required_features: ffgpu::required_wgpu_device_features(&adapter),
+            ..Default::default()
+        },
+    ))
+    .expect("device");
+
+    let mut ctx = ffgpu::Context::new(&instance, &adapter, &device, &queue).expect("context");
+    let (mut video, _audio) = ctx.create_video(path).expect("create_video");
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("test_encoder"),
+    });
+
+    let mut decoded_count = 0;
+    for i in 0..60 {
+        match video.update(&mut encoder) {
+            Ok((_wait, decoded)) => {
+                if decoded {
+                    decoded_count += 1;
+                    let views = video.plane_views().expect("plane_views");
+                    assert_eq!(views.len(), 2, "HEVC Main 10 (P010) must have 2 plane views (Y, UV)");
+                    let _ = queue.submit(Some(encoder.finish()));
+                    video.release_completed_frames().unwrap();
+                    encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("test_encoder"),
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
+            Err(e) => {
+                panic!("[test_hevc_10bit] step {} failed: {:?}", i, e);
+            }
+        }
+    }
+    assert!(decoded_count > 0, "Expected at least 1 decoded frame");
+}
+
+#[test]
+fn test_video_player_playback_hevc_10bit_dma() {
+    unsafe { std::env::set_var("NEXA_CUDA_FORCE_DMA", "1"); }
+    ffmpeg_next::init().unwrap();
+    let path = std::path::Path::new(r"E:\OP darkins.mov");
+    if !path.exists() {
+        return;
+    }
+
+    let instance = wgpu::Instance::default();
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+    }))
+    .expect("adapter");
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            required_features: ffgpu::required_wgpu_device_features(&adapter),
+            ..Default::default()
+        },
+    ))
+    .expect("device");
+
+    let mut ctx = ffgpu::Context::new(&instance, &adapter, &device, &queue).expect("context");
+    let (mut video, _audio) = ctx.create_video(path).expect("create_video");
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("test_encoder"),
+    });
+
+    let mut decoded_count = 0;
+    for i in 0..60 {
+        match video.update(&mut encoder) {
+            Ok((_wait, decoded)) => {
+                if decoded {
+                    decoded_count += 1;
+                    let views = video.plane_views().expect("plane_views");
+                    assert_eq!(views.len(), 2, "HEVC Main 10 (P010) must have 2 plane views (Y, UV)");
+                    let _ = queue.submit(Some(encoder.finish()));
+                    video.release_completed_frames().unwrap();
+                    encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("test_encoder"),
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
+            Err(e) => {
+                panic!("[test_hevc_10bit_dma] step {} failed: {:?}", i, e);
+            }
+        }
+    }
+    assert!(decoded_count > 0, "Expected at least 1 decoded frame");
+}
+

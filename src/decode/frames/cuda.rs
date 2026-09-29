@@ -419,6 +419,16 @@ impl CudaPlanes {
         driver: &'static CudaDriver,
         pipeline_cache: &mut PipelineCache,
     ) -> Result<Self> {
+        // CUDA NVDEC surfaces for 4:2:0 video are always semi-planar (NV12 for 8-bit,
+        // P010 for 10/12/16-bit). Normalize 4:2:0 formats to their semi-planar counterpart.
+        let sw_format = match sw_format {
+            ff::AVPixelFormat::AV_PIX_FMT_YUV420P => ff::AVPixelFormat::AV_PIX_FMT_NV12,
+            ff::AVPixelFormat::AV_PIX_FMT_YUV420P10LE
+            | ff::AVPixelFormat::AV_PIX_FMT_YUV420P12LE
+            | ff::AVPixelFormat::AV_PIX_FMT_P016LE => ff::AVPixelFormat::AV_PIX_FMT_P010LE,
+            other => other,
+        };
+
         let descriptor = layout::av_pixel_texture_format(sw_format)
             .ok_or(Error::UnsupportedPixelFormat)?;
 
@@ -599,9 +609,12 @@ impl CudaPlanes {
             })
         })();
 
-        if let Ok(direct_planes) = direct_res {
-            eprintln!("[CUDA-NVDEC] Active mode: Tier 1 True Zero-Copy (GPU VRAM)");
-            return Ok(CudaPlanes::Direct(direct_planes));
+        let force_dma = std::env::var("NEXA_CUDA_FORCE_DMA").is_ok();
+        if !force_dma {
+            if let Ok(direct_planes) = direct_res {
+                eprintln!("[CUDA-NVDEC] Active mode: Tier 1 True Zero-Copy (GPU VRAM)");
+                return Ok(CudaPlanes::Direct(direct_planes));
+            }
         }
 
         // 2. Fall back to Tier 2: Pinned Host DMA
@@ -877,10 +890,24 @@ impl FrameAdapter for CudaZeroCopyFrameAdapter {
             unsafe { (*self._decoder.as_ptr()).sw_pix_fmt }
         };
 
-        let sw_format = if sw_format == ff::AVPixelFormat::AV_PIX_FMT_NONE {
-            ff::AVPixelFormat::AV_PIX_FMT_NV12
-        } else {
-            sw_format
+        let sw_format = match sw_format {
+            ff::AVPixelFormat::AV_PIX_FMT_NONE | ff::AVPixelFormat::AV_PIX_FMT_YUV420P => {
+                ff::AVPixelFormat::AV_PIX_FMT_NV12
+            }
+            ff::AVPixelFormat::AV_PIX_FMT_YUV420P10LE
+            | ff::AVPixelFormat::AV_PIX_FMT_YUV420P12LE
+            | ff::AVPixelFormat::AV_PIX_FMT_P016LE => ff::AVPixelFormat::AV_PIX_FMT_P010LE,
+            other => {
+                // If frame has no third plane data, 4:2:0 streams are physically semi-planar in VRAM
+                if frame_ref.data[2].is_null() || frame_ref.linesize[2] == 0 {
+                    match other {
+                        ff::AVPixelFormat::AV_PIX_FMT_YUV420P => ff::AVPixelFormat::AV_PIX_FMT_NV12,
+                        _ => other,
+                    }
+                } else {
+                    other
+                }
+            }
         };
 
         let width = frame_ref.width as u32;
