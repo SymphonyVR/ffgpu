@@ -375,6 +375,17 @@ impl CudaPlanes {
             layout::Depth::D10 | layout::Depth::D12 | layout::Depth::D16 => 2,
         };
 
+        if bytes_per_channel == 2
+            && !device
+                .features()
+                .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+        {
+            eprintln!(
+                "[CUDA-NVDEC] 10/12/16-bit video format requires TEXTURE_FORMAT_16BIT_NORM, but device lacks this feature"
+            );
+            return Err(Error::UnsupportedPixelFormat);
+        }
+
         // 1. Try Tier 1: True Zero-Copy (VRAM)
         let direct_res: Result<DirectPlanes> = (|| unsafe {
             let mut direct_planes = Vec::new();
