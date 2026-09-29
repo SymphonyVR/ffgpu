@@ -46,13 +46,20 @@ const OPTIONAL_FFMPEG_EXTENSIONS: &[&std::ffi::CStr] = &[
     c"VK_KHR_shader_expect_assume",
     c"VK_EXT_host_image_copy",
     c"VK_KHR_shader_relaxed_extended_instruction",
+    #[cfg(target_os = "linux")]
     c"VK_KHR_external_memory_fd",
+    #[cfg(target_os = "linux")]
     c"VK_KHR_external_semaphore_fd",
+    #[cfg(target_os = "windows")]
     c"VK_KHR_external_memory_win32",
+    #[cfg(target_os = "windows")]
     c"VK_KHR_external_semaphore_win32",
     c"VK_EXT_external_memory_host",
+    #[cfg(target_os = "linux")]
     c"VK_EXT_external_memory_dma_buf",
+    #[cfg(target_os = "linux")]
     c"VK_EXT_image_drm_format_modifier",
+    #[cfg(target_os = "linux")]
     c"VK_EXT_physical_device_drm",
 ];
 
