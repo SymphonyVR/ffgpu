@@ -79,7 +79,15 @@ impl ImportedTexture {
         desc: &D3D11::D3D11_TEXTURE2D_DESC,
         color_space: ffn::color::Space,
     ) -> Result<Self> {
-        if get_dxgi_yuv_format(desc.Format).is_none() {
+        let yuv_fmt = get_dxgi_yuv_format(desc.Format).ok_or(Error::UnsupportedPixelFormat)?;
+        if yuv_fmt == wgpu::TextureFormat::P010
+            && !device
+                .features()
+                .contains(wgpu::Features::TEXTURE_FORMAT_P010)
+        {
+            eprintln!(
+                "[d3d11va] DXGI format P010 requires TEXTURE_FORMAT_P010, but device lacks this feature"
+            );
             return Err(Error::UnsupportedPixelFormat);
         }
 
@@ -124,7 +132,15 @@ impl ImportedTexture {
         desc: &D3D11::D3D11_TEXTURE2D_DESC,
         color_space: ffn::color::Space,
     ) -> Result<Self> {
-        if get_dxgi_yuv_format(desc.Format).is_none() {
+        let yuv_fmt = get_dxgi_yuv_format(desc.Format).ok_or(Error::UnsupportedPixelFormat)?;
+        if yuv_fmt == wgpu::TextureFormat::P010
+            && !device
+                .features()
+                .contains(wgpu::Features::TEXTURE_FORMAT_P010)
+        {
+            eprintln!(
+                "[d3d11va] DXGI format P010 requires TEXTURE_FORMAT_P010, but device lacks this feature"
+            );
             return Err(Error::UnsupportedPixelFormat);
         }
 

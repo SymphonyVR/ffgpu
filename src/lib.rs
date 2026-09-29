@@ -28,7 +28,7 @@ pub use vulkan_device::{VulkanVideoDevice, create_vulkan_device_for_video};
 
 #[cfg(target_os = "windows")]
 pub fn required_wgpu_device_features(adapter: &wgpu::Adapter) -> wgpu::Features {
-    match adapter.get_info().backend {
+    let desired = match adapter.get_info().backend {
         wgpu::Backend::Vulkan => {
             wgpu::Features::TEXTURE_FORMAT_NV12
                 | wgpu::Features::TEXTURE_FORMAT_P010
@@ -41,19 +41,21 @@ pub fn required_wgpu_device_features(adapter: &wgpu::Adapter) -> wgpu::Features 
                 | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
         }
         _ => wgpu::Features::empty(),
-    }
+    };
+    desired & adapter.features()
 }
 
 #[cfg(target_os = "linux")]
 pub fn required_wgpu_device_features(adapter: &wgpu::Adapter) -> wgpu::Features {
-    match adapter.get_info().backend {
+    let desired = match adapter.get_info().backend {
         wgpu::Backend::Vulkan => {
             wgpu::Features::TEXTURE_FORMAT_NV12
                 | wgpu::Features::TEXTURE_FORMAT_P010
                 | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
         }
         _ => wgpu::Features::empty(),
-    }
+    };
+    desired & adapter.features()
 }
 
 #[cfg(target_os = "macos")]

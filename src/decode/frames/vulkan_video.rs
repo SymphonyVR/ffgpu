@@ -551,6 +551,16 @@ impl VulkanVideoFrameAdapter {
         let textures = if is_multiplane {
             // Single multi-plane destination texture (NV12 or P010).
             let mp_fmt = multiplane_format.unwrap();
+            if mp_fmt == wgpu::TextureFormat::P010
+                && !device
+                    .features()
+                    .contains(wgpu::Features::TEXTURE_FORMAT_P010)
+            {
+                log::warn!(
+                    "[VulkanVideo] P010 presentation texture requires TEXTURE_FORMAT_P010, but device lacks this feature"
+                );
+                return Err(Error::UnsupportedBackend);
+            }
             let tex = unsafe {
                 create_raw_vulkan_texture(
                     device,
