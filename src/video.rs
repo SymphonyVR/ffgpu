@@ -37,16 +37,21 @@ enum FrameResponse {
     Requeue,
 }
 
+#[inline]
+fn is_cuda_supported_codec(codec_id: i32) -> bool {
+    codec_id == ff::AVCodecID::AV_CODEC_ID_H264 as i32
+        || codec_id == ff::AVCodecID::AV_CODEC_ID_HEVC as i32
+        || codec_id == ff::AVCodecID::AV_CODEC_ID_VP9 as i32
+        || codec_id == ff::AVCodecID::AV_CODEC_ID_VP8 as i32
+        || codec_id == ff::AVCodecID::AV_CODEC_ID_MPEG4 as i32
+        || codec_id == ff::AVCodecID::AV_CODEC_ID_MPEG2VIDEO as i32
+        || codec_id == ff::AVCodecID::AV_CODEC_ID_VC1 as i32
+}
+
 #[cfg(target_os = "windows")]
 fn preferred_device_type_for_backend(backend: wgpu::Backend) -> ff::AVHWDeviceType {
     match backend {
-        wgpu::Backend::Vulkan => {
-            if crate::cuda_interop::is_cuda_available() {
-                ff::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA
-            } else {
-                ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN
-            }
-        }
+        wgpu::Backend::Vulkan => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
         wgpu::Backend::Dx12 => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
         _ => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
     }
@@ -60,13 +65,7 @@ fn preferred_device_type_for_backend(_backend: wgpu::Backend) -> ff::AVHWDeviceT
 #[cfg(target_os = "linux")]
 fn preferred_device_type_for_backend(backend: wgpu::Backend) -> ff::AVHWDeviceType {
     match backend {
-        wgpu::Backend::Vulkan => {
-            if crate::cuda_interop::is_cuda_available() {
-                ff::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA
-            } else {
-                ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN
-            }
-        }
+        wgpu::Backend::Vulkan => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
         _ => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
     }
 }
@@ -258,30 +257,17 @@ impl Video {
         let mut hw_device_ctx = hw_device_ctx;
 
         let mut routed_away = false;
-        if device_type == ff::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA {
-            hw_device_ctx = None;
-            let (codec_id, profile_id) =
-                unsafe { read_video_stream_profile(&mut input.format_ctx) };
-            let stream = crate::video_caps::classify(codec_id, profile_id);
-            if matches!(stream.codec, crate::video_caps::StreamCodecClass::Other) {
-                eprintln!(
-                    "[Video] CUDA NVDEC cannot decode codec_id={codec_id} ({stream:?}); falling back to software decode"
-                );
-                device_type = ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
-                routed_away = true;
-            }
-        }
-
         // Capability admission (bug-1789674498884): BEFORE handing the
         // stream to the Vulkan hwaccel, verify the device explicitly
         // reported the stream's decode profile. An admitted-but-unreported
         // stream can BLOCK inside avcodec_open2 in the driver (observed:
         // HEVC 4:4:4 Rext on RTX 2060 driver 596.36 deadlocks the process
         // before FFmpeg's own get_format probe could reject it). Routing
-        // (user ruling 2026-09-17): admitted -> Vulkan; unreported on
-        // Windows -> D3D11VA (its own probe ladder handles the rest — the
-        // pre-fix logs prove D3D11VA/NVDEC decoded these exact streams);
-        // elsewhere -> software. A Vulkan denial never conflates "Vulkan
+        // hierarchy:
+        // 1. Vulkan Video (if admitted by capability matrix)
+        // 2. CUDA NVDEC (if available and codec is supported by NVDEC hardware)
+        // 3. D3D11VA (on Windows when CUDA is not available, e.g. Intel/AMD)
+        // 4. Software decode (fallback when no hardware decoder can handle the stream)
         if device_type == ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN {
             let (codec_id, profile_id) =
                 unsafe { read_video_stream_profile(&mut input.format_ctx) };
@@ -294,24 +280,28 @@ impl Video {
             match route {
                 crate::video_caps::DecodeRoute::Vulkan => {}
                 crate::video_caps::DecodeRoute::D3d11va => {
-                    eprintln!(
-                        "[Video] Vulkan decode denied by capability admission \
-                         (codec_id={codec_id}, profile_id={profile_id}, class={stream:?}); \
-                         routing to D3D11VA"
-                    );
-                    device_type = ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA;
-                    hw_device_ctx = None;
-                    routed_away = true;
+                    if crate::cuda_interop::is_cuda_available() && is_cuda_supported_codec(codec_id) {
+                        eprintln!(
+                            "[Video] Vulkan decode denied by capability admission \
+                             (codec_id={codec_id}, profile_id={profile_id}, class={stream:?}); \
+                             routing to CUDA NVDEC"
+                        );
+                        device_type = ff::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA;
+                        hw_device_ctx = None;
+                        routed_away = true;
+                    } else {
+                        eprintln!(
+                            "[Video] Vulkan decode denied by capability admission \
+                             (codec_id={codec_id}, profile_id={profile_id}, class={stream:?}); \
+                             routing to D3D11VA"
+                        );
+                        device_type = ff::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA;
+                        hw_device_ctx = None;
+                        routed_away = true;
+                    }
                 }
                 crate::video_caps::DecodeRoute::Software => {
-                    #[cfg(target_os = "linux")]
-                    if crate::cuda_interop::is_cuda_available()
-                        && matches!(
-                            stream.codec,
-                            crate::video_caps::StreamCodecClass::H264
-                                | crate::video_caps::StreamCodecClass::H265
-                        )
-                    {
+                    if crate::cuda_interop::is_cuda_available() && is_cuda_supported_codec(codec_id) {
                         eprintln!(
                             "[Video] Vulkan decode denied by capability admission \
                              (codec_id={codec_id}, profile_id={profile_id}, class={stream:?}); \
@@ -330,18 +320,20 @@ impl Video {
                         hw_device_ctx = None;
                         routed_away = true;
                     }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        eprintln!(
-                            "[Video] Vulkan decode denied by capability admission \
-                             (codec_id={codec_id}, profile_id={profile_id}, class={stream:?}); \
-                             using software decode"
-                        );
-                        device_type = ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
-                        hw_device_ctx = None;
-                        routed_away = true;
-                    }
                 }
+            }
+        }
+
+        if device_type == ff::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA {
+            hw_device_ctx = None;
+            let (codec_id, _profile_id) =
+                unsafe { read_video_stream_profile(&mut input.format_ctx) };
+            if !is_cuda_supported_codec(codec_id) {
+                eprintln!(
+                    "[Video] CUDA NVDEC cannot decode codec_id={codec_id}; falling back to software decode"
+                );
+                device_type = ff::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE;
+                routed_away = true;
             }
         }
 
